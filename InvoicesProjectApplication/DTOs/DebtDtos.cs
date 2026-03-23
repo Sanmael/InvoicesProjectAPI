@@ -1,0 +1,55 @@
+namespace InvoicesProjectApplication.DTOs;
+
+public record DebtDto(
+    Guid Id,
+    string Description,
+    decimal Amount,
+    DateTime DueDate,
+    bool IsPaid,
+    DateTime? PaidAt,
+    string? Notes,
+    bool IsInstallment,
+    int? TotalInstallments,
+    int? InstallmentNumber,
+    Guid? InstallmentGroupId,
+    DateTime CreatedAt
+);
+
+public record CreateDebtDto(
+    string Description,
+    decimal Amount,
+    DateTime DueDate,
+    string? Notes
+);
+
+/// <summary>
+/// Cria uma dívida parcelada (ex: dívida informal paga em parcelas mensais).
+/// O valor informado é o total; cada parcela = TotalAmount / Installments.
+/// </summary>
+public record CreateInstallmentDebtDto(
+    string Description,
+    decimal TotalAmount,    // Valor total da dívida
+    DateTime FirstDueDate,  // Vencimento da 1ª parcela
+    int Installments,       // Número de parcelas (máx 60)
+    string? Notes
+);
+
+/// <summary>
+/// Cria um débito recorrente mensal (ex: ajuda mensal) para os próximos N meses.
+/// </summary>
+public record CreateRecurringDebtDto(
+    string Description,
+    decimal Amount,
+    int RecurringDay,
+    int Months,
+    DateTime? StartDate,
+    string? Notes
+);
+
+public record UpdateDebtDto(
+    string? Description,
+    decimal? Amount,
+    DateTime? DueDate,
+    bool? IsPaid,
+    string? Notes
+);
