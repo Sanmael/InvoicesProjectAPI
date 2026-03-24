@@ -51,6 +51,8 @@ public static class DependencyInjection
         services.AddScoped<INotificationPreferenceService, NotificationPreferenceService>();
         services.AddScoped<IEmailSettingsService, EmailSettingsService>();
         services.AddScoped<INotificationService, NotificationService>();
+        services.AddScoped<IChatService, ChatService>();
+        services.AddHttpClient("Groq");
         services.AddHostedService<NotificationProcessingHostedService>();
 
         // JWT Authentication
