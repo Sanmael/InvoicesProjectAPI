@@ -182,6 +182,10 @@ async function handleDeleteGroup(groupId: string) {
 
     <div v-if="receivableStore.loading" class="loading">Carregando...</div>
 
+    <div v-else-if="receivableStore.error" class="error-alert">
+      {{ receivableStore.error }}
+    </div>
+
     <div v-else-if="receivableStore.receivables.length === 0" class="empty-state">
       <p>Nenhum recebível cadastrado</p>
       <button @click="openModal" class="btn-primary">Criar primeiro Recebível</button>

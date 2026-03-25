@@ -214,7 +214,7 @@ public class NotificationService : INotificationService
     private async Task CheckUpcomingDebtsAsync(User user, NotificationPreference preference)
     {
         var debts = await _debtRepository.GetPendingByUserIdAsync(user.Id);
-        var today = DateTime.UtcNow.Date;
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
 
         foreach (var debt in debts)
         {
@@ -223,7 +223,7 @@ public class NotificationService : INotificationService
             if (await _notificationRepository.ExistsByReferenceKeyAsync(user.Id, referenceKey))
                 continue;
 
-            var daysUntilDue = (debt.DueDate.Date - today).Days;
+            var daysUntilDue = debt.DueDate.DayNumber - today.DayNumber;
 
             if (daysUntilDue >= 0 && daysUntilDue <= preference.DaysBeforeDebtDueNotification)
             {
@@ -242,7 +242,7 @@ public class NotificationService : INotificationService
     private async Task CheckUpcomingReceivablesAsync(User user, NotificationPreference preference)
     {
         var receivables = await _receivableRepository.GetPendingByUserIdAsync(user.Id);
-        var today = DateTime.UtcNow.Date;
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
 
         foreach (var receivable in receivables)
         {
@@ -251,7 +251,7 @@ public class NotificationService : INotificationService
             if (await _notificationRepository.ExistsByReferenceKeyAsync(user.Id, referenceKey))
                 continue;
 
-            var daysUntilExpected = (receivable.ExpectedDate.Date - today).Days;
+            var daysUntilExpected = receivable.ExpectedDate.DayNumber - today.DayNumber;
 
             if (daysUntilExpected >= 0 && daysUntilExpected <= preference.DaysBeforeReceivableNotification)
             {
@@ -479,7 +479,7 @@ public class NotificationService : INotificationService
     }
 
     private static string GenerateDebtReminderEmail(string userName, string description, decimal amount, 
-        DateTime dueDate, int daysUntilDue)
+        DateOnly dueDate, int daysUntilDue)
     {
         var urgencyColor = daysUntilDue == 0 ? "#dc3545" : "#ffc107";
         return $@"
@@ -516,7 +516,7 @@ public class NotificationService : INotificationService
     }
 
     private static string GenerateReceivableReminderEmail(string userName, string description, decimal amount, 
-        DateTime expectedDate, int daysUntilExpected)
+        DateOnly expectedDate, int daysUntilExpected)
     {
         return $@"
 <!DOCTYPE html>

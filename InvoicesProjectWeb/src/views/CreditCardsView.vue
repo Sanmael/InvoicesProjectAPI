@@ -132,6 +132,10 @@ async function handleDeleteCard(id: string) {
 
     <div v-if="cardStore.loading" class="loading">Carregando...</div>
 
+    <div v-else-if="cardStore.error" class="error-alert">
+      {{ cardStore.error }}
+    </div>
+
     <div v-else-if="cardStore.cards.length === 0" class="empty-state">
       <p>Nenhum cartão cadastrado</p>
       <button @click="openCardModal" class="btn-primary">Adicionar primeiro cartão</button>

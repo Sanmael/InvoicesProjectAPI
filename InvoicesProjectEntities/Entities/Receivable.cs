@@ -7,7 +7,7 @@ public class Receivable : BaseEntity
 {
     public string Description { get; set; } = string.Empty;
     public decimal Amount { get; set; }
-    public DateTime ExpectedDate { get; set; }
+    public DateOnly ExpectedDate { get; set; }
     public bool IsReceived { get; set; } = false;
     public DateTime? ReceivedAt { get; set; }
     public string? Notes { get; set; }

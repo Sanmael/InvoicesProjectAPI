@@ -205,6 +205,10 @@ async function handleDeleteGroup(groupId: string) {
 
     <div v-if="debtStore.loading" class="loading">Carregando...</div>
 
+    <div v-else-if="debtStore.error" class="error-alert">
+      {{ debtStore.error }}
+    </div>
+
     <div v-else-if="debtStore.debts.length === 0" class="empty-state">
       <p>Nenhum débito cadastrado</p>
       <button @click="openModal" class="btn-primary">Criar primeiro débito</button>

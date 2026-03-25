@@ -57,12 +57,15 @@ public class ReceivableService : IReceivableService
 
         var groupId = Guid.NewGuid();
         var results = new List<ReceivableDto>();
-        var today = DateTime.UtcNow;
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var firstExpectedDate = new DateOnly(today.Year, today.Month, dto.RecurringDay);
+
+        if (firstExpectedDate < today)
+            firstExpectedDate = firstExpectedDate.AddMonths(1);
 
         for (int i = 0; i < dto.Months; i++)
         {
-            var targetDate = new DateTime(today.Year, today.Month, dto.RecurringDay, 0, 0, 0, DateTimeKind.Utc)
-                .AddMonths(i);
+            var targetDate = firstExpectedDate.AddMonths(i);
 
             var receivable = new Receivable
             {

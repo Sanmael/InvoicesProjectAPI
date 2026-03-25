@@ -4,7 +4,7 @@ public record ReceivableDto(
     Guid Id,
     string Description,
     decimal Amount,
-    DateTime ExpectedDate,
+    DateOnly ExpectedDate,
     bool IsReceived,
     DateTime? ReceivedAt,
     string? Notes,
@@ -17,7 +17,7 @@ public record ReceivableDto(
 public record CreateReceivableDto(
     string Description,
     decimal Amount,
-    DateTime ExpectedDate,
+    DateOnly ExpectedDate,
     string? Notes
 );
 
@@ -35,7 +35,7 @@ public record CreateRecurringReceivableDto(
 public record UpdateReceivableDto(
     string? Description,
     decimal? Amount,
-    DateTime? ExpectedDate,
+    DateOnly? ExpectedDate,
     bool? IsReceived,
     string? Notes
 );

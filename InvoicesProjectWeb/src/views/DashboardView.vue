@@ -172,6 +172,11 @@ const displayedReceivables = computed(() => {
       Carregando...
     </div>
 
+    <!-- Error state -->
+    <div v-else-if="summaryStore.error" class="error-alert">
+      {{ summaryStore.error }}
+    </div>
+
     <!-- Summary Cards -->
     <div v-else-if="summaryStore.summary" class="summary-grid">
       <div class="summary-card balance" :class="balanceClass">

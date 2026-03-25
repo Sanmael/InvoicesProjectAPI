@@ -90,8 +90,8 @@ public class DebtService : IDebtService
 
         var groupId = Guid.NewGuid();
         var results = new List<DebtDto>();
-        var startDate = (dto.StartDate ?? DateTime.UtcNow).Date;
-        var firstDueDate = new DateTime(startDate.Year, startDate.Month, dto.RecurringDay, 0, 0, 0, DateTimeKind.Utc);
+        var startDate = dto.StartDate ?? DateOnly.FromDateTime(DateTime.UtcNow);
+        var firstDueDate = new DateOnly(startDate.Year, startDate.Month, dto.RecurringDay);
 
         if (firstDueDate < startDate)
             firstDueDate = firstDueDate.AddMonths(1);

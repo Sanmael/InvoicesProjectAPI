@@ -4,7 +4,7 @@ public record DebtDto(
     Guid Id,
     string Description,
     decimal Amount,
-    DateTime DueDate,
+    DateOnly DueDate,
     bool IsPaid,
     DateTime? PaidAt,
     string? Notes,
@@ -18,7 +18,7 @@ public record DebtDto(
 public record CreateDebtDto(
     string Description,
     decimal Amount,
-    DateTime DueDate,
+    DateOnly DueDate,
     string? Notes
 );
 
@@ -29,7 +29,7 @@ public record CreateDebtDto(
 public record CreateInstallmentDebtDto(
     string Description,
     decimal TotalAmount,    // Valor total da dívida
-    DateTime FirstDueDate,  // Vencimento da 1ª parcela
+    DateOnly FirstDueDate,  // Vencimento da 1ª parcela
     int Installments,       // Número de parcelas (máx 60)
     string? Notes
 );
@@ -42,14 +42,14 @@ public record CreateRecurringDebtDto(
     decimal Amount,
     int RecurringDay,
     int Months,
-    DateTime? StartDate,
+    DateOnly? StartDate,
     string? Notes
 );
 
 public record UpdateDebtDto(
     string? Description,
     decimal? Amount,
-    DateTime? DueDate,
+    DateOnly? DueDate,
     bool? IsPaid,
     string? Notes
 );

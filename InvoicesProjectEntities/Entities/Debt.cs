@@ -7,7 +7,7 @@ public class Debt : BaseEntity
 {
     public string Description { get; set; } = string.Empty;
     public decimal Amount { get; set; }
-    public DateTime DueDate { get; set; }
+    public DateOnly DueDate { get; set; }
     public bool IsPaid { get; set; } = false;
     public DateTime? PaidAt { get; set; }
     public string? Notes { get; set; }
