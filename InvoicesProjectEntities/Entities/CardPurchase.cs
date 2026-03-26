@@ -12,6 +12,7 @@ public class CardPurchase : BaseEntity
     public int CurrentInstallment { get; set; } = 1; // Parcela atual
     public bool IsPaid { get; set; } = false;
     public string? Notes { get; set; }
+    public string Category { get; set; } = "Outros";
 
     // Foreign keys
     public Guid CreditCardId { get; set; }

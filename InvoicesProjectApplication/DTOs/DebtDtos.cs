@@ -8,6 +8,7 @@ public record DebtDto(
     bool IsPaid,
     DateTime? PaidAt,
     string? Notes,
+    string Category,
     bool IsInstallment,
     int? TotalInstallments,
     int? InstallmentNumber,
@@ -19,7 +20,8 @@ public record CreateDebtDto(
     string Description,
     decimal Amount,
     DateOnly DueDate,
-    string? Notes
+    string? Notes,
+    string? Category = null
 );
 
 /// <summary>
@@ -31,7 +33,8 @@ public record CreateInstallmentDebtDto(
     decimal TotalAmount,    // Valor total da dívida
     DateOnly FirstDueDate,  // Vencimento da 1ª parcela
     int Installments,       // Número de parcelas (máx 60)
-    string? Notes
+    string? Notes,
+    string? Category = null
 );
 
 /// <summary>
@@ -43,7 +46,8 @@ public record CreateRecurringDebtDto(
     int RecurringDay,
     int Months,
     DateOnly? StartDate,
-    string? Notes
+    string? Notes,
+    string? Category = null
 );
 
 public record UpdateDebtDto(
@@ -51,5 +55,6 @@ public record UpdateDebtDto(
     decimal? Amount,
     DateOnly? DueDate,
     bool? IsPaid,
-    string? Notes
+    string? Notes,
+    string? Category = null
 );

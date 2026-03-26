@@ -1,6 +1,7 @@
 using InvoicesProjectApplication.DTOs;
 using InvoicesProjectApplication.Interfaces;
 using InvoicesProjectEntities.Entities;
+using InvoicesProjectEntities.Enums;
 using InvoicesProjectEntities.Interfaces;
 
 namespace InvoicesProjectApplication.Services;
@@ -40,7 +41,8 @@ public class DebtService : IDebtService
             Description = dto.Description,
             Amount = dto.Amount,
             DueDate = dto.DueDate,
-            Notes = dto.Notes
+            Notes = dto.Notes,
+            Category = ExpenseCategory.Normalize(dto.Category)
         };
 
         await _debtRepository.AddAsync(debt);
@@ -54,6 +56,7 @@ public class DebtService : IDebtService
 
         var groupId = Guid.NewGuid();
         var installmentAmount = Math.Round(dto.TotalAmount / dto.Installments, 2);
+        var category = ExpenseCategory.Normalize(dto.Category);
         var results = new List<DebtDto>();
 
         for (int i = 0; i < dto.Installments; i++)
@@ -67,6 +70,7 @@ public class DebtService : IDebtService
                 Amount = installmentAmount,
                 DueDate = dueDate,
                 Notes = dto.Notes,
+                Category = category,
                 IsInstallment = true,
                 TotalInstallments = dto.Installments,
                 InstallmentNumber = i + 1,
@@ -90,6 +94,7 @@ public class DebtService : IDebtService
 
         var groupId = Guid.NewGuid();
         var results = new List<DebtDto>();
+        var category = ExpenseCategory.Normalize(dto.Category);
         var startDate = dto.StartDate ?? DateOnly.FromDateTime(DateTime.UtcNow);
         var firstDueDate = new DateOnly(startDate.Year, startDate.Month, dto.RecurringDay);
 
@@ -107,6 +112,7 @@ public class DebtService : IDebtService
                 Amount = dto.Amount,
                 DueDate = dueDate,
                 Notes = dto.Notes,
+                Category = category,
                 IsInstallment = false,
                 TotalInstallments = dto.Months,
                 InstallmentNumber = i + 1,
@@ -143,6 +149,9 @@ public class DebtService : IDebtService
         if (dto.Notes is not null)
             debt.Notes = dto.Notes;
 
+        if (dto.Category is not null)
+            debt.Category = ExpenseCategory.Normalize(dto.Category);
+
         debt.UpdatedAt = DateTime.UtcNow;
         await _debtRepository.UpdateAsync(debt);
         return MapToDto(debt);
@@ -175,7 +184,7 @@ public class DebtService : IDebtService
 
     private static DebtDto MapToDto(Debt debt) =>
         new(debt.Id, debt.Description, debt.Amount, debt.DueDate,
-            debt.IsPaid, debt.PaidAt, debt.Notes,
+            debt.IsPaid, debt.PaidAt, debt.Notes, debt.Category,
             debt.IsInstallment, debt.TotalInstallments, debt.InstallmentNumber, debt.InstallmentGroupId,
             debt.CreatedAt);
 }

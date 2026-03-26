@@ -121,5 +121,5 @@ public class CreditCardService : ICreditCardService
     private static CardPurchaseDto MapPurchaseToDto(CardPurchase purchase) =>
         new(purchase.Id, purchase.CreditCardId, purchase.Description, purchase.Amount,
             purchase.PurchaseDate, purchase.Installments, purchase.CurrentInstallment,
-            purchase.IsPaid, purchase.Notes, purchase.CreatedAt);
+            purchase.IsPaid, purchase.Notes, purchase.Category, purchase.CreatedAt);
 }

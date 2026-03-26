@@ -40,6 +40,7 @@ public class AppDbContext : DbContext
             entity.Property(e => e.Description).HasMaxLength(500).IsRequired();
             entity.Property(e => e.Amount).HasPrecision(18, 2);
             entity.Property(e => e.Notes).HasMaxLength(1000);
+            entity.Property(e => e.Category).HasMaxLength(50).HasDefaultValue("Outros");
             
             entity.HasOne(e => e.User)
                 .WithMany(u => u.Debts)
@@ -82,6 +83,7 @@ public class AppDbContext : DbContext
             entity.Property(e => e.Description).HasMaxLength(500).IsRequired();
             entity.Property(e => e.Amount).HasPrecision(18, 2);
             entity.Property(e => e.Notes).HasMaxLength(1000);
+            entity.Property(e => e.Category).HasMaxLength(50).HasDefaultValue("Outros");
             
             entity.HasOne(e => e.CreditCard)
                 .WithMany(c => c.Purchases)

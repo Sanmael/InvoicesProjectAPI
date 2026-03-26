@@ -11,6 +11,7 @@ public class Debt : BaseEntity
     public bool IsPaid { get; set; } = false;
     public DateTime? PaidAt { get; set; }
     public string? Notes { get; set; }
+    public string Category { get; set; } = "Outros";
 
     // Parcelamento (ex: dívida informal parcelada)
     public bool IsInstallment { get; set; } = false;

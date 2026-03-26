@@ -1,6 +1,7 @@
 using InvoicesProjectApplication.DTOs;
 using InvoicesProjectApplication.Interfaces;
 using InvoicesProjectEntities.Entities;
+using InvoicesProjectEntities.Enums;
 using InvoicesProjectEntities.Interfaces;
 
 namespace InvoicesProjectApplication.Services;
@@ -49,7 +50,8 @@ public class CardPurchaseService : ICardPurchaseService
             PurchaseDate = dto.PurchaseDate,
             Installments = dto.Installments,
             CurrentInstallment = 1,
-            Notes = dto.Notes
+            Notes = dto.Notes,
+            Category = ExpenseCategory.Normalize(dto.Category)
         };
 
         await _cardPurchaseRepository.AddAsync(purchase);
@@ -79,6 +81,9 @@ public class CardPurchaseService : ICardPurchaseService
         if (dto.Notes is not null)
             purchase.Notes = dto.Notes;
 
+        if (dto.Category is not null)
+            purchase.Category = ExpenseCategory.Normalize(dto.Category);
+
         purchase.UpdatedAt = DateTime.UtcNow;
         await _cardPurchaseRepository.UpdateAsync(purchase);
         return MapToDto(purchase);
@@ -104,5 +109,5 @@ public class CardPurchaseService : ICardPurchaseService
     private static CardPurchaseDto MapToDto(CardPurchase purchase) =>
         new(purchase.Id, purchase.CreditCardId, purchase.Description, purchase.Amount,
             purchase.PurchaseDate, purchase.Installments, purchase.CurrentInstallment,
-            purchase.IsPaid, purchase.Notes, purchase.CreatedAt);
+            purchase.IsPaid, purchase.Notes, purchase.Category, purchase.CreatedAt);
 }

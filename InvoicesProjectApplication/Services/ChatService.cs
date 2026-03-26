@@ -6,6 +6,8 @@ using InvoicesProjectApplication.Interfaces;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
+using InvoicesProjectEntities.Enums;
+
 namespace InvoicesProjectApplication.Services;
 
 public class ChatService : IChatService
@@ -90,8 +92,11 @@ public class ChatService : IChatService
 
             try
             {
-                _logger.LogInformation("Tentando provider {Provider} ({Model})", provider.Name, provider.Model);
-                return await CallProvider(userId, request, provider);
+                _logger.LogInformation("Tentando provider {Provider} ({Model})", provider.Name, provider.Model);                
+
+                return IsGeminiProvider(provider)
+                    ? await CallGeminiProvider(userId, request, provider)
+                    : await CallProvider(userId, request, provider);
             }
             catch (HttpRequestException ex) when (!isLast && IsRateLimitOrUnavailable(ex))
             {
@@ -108,6 +113,9 @@ public class ChatService : IChatService
             or System.Net.HttpStatusCode.ServiceUnavailable
             or System.Net.HttpStatusCode.BadGateway
             or System.Net.HttpStatusCode.GatewayTimeout;
+
+    private static bool IsGeminiProvider(ProviderConfig provider) =>
+        provider.Name.Equals("Gemini", StringComparison.OrdinalIgnoreCase);
 
     private async Task<ChatResponseDto> CallProvider(Guid userId, ChatRequestDto request, ProviderConfig provider)
     {
@@ -220,6 +228,125 @@ public class ChatService : IChatService
             string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary, actions);
     }
 
+    // ─── GEMINI PROVIDER ───
+
+    private async Task<ChatResponseDto> CallGeminiProvider(Guid userId, ChatRequestDto request, ProviderConfig provider)
+    {
+        var (systemText, contents) = BuildGeminiContents(request, provider.DisableThinking);
+        var toolDeclarations = GetGeminiToolDeclarations();
+
+        var geminiRequest = new
+        {
+            systemInstruction = new { parts = new[] { new { text = systemText } } },
+            contents,
+            tools = new[] { new { functionDeclarations = toolDeclarations } },
+            toolConfig = new { functionCallingConfig = new { mode = "AUTO" } },
+            generationConfig = new { temperature = 0.1, maxOutputTokens = 1500 }
+        };
+
+        var client = _httpClientFactory.CreateClient("ChatProvider");
+        client.DefaultRequestHeaders.Clear();
+
+        var url = $"{provider.BaseUrl}/models/{provider.Model}:generateContent?key={provider.ApiKey}";
+        var response = await client.PostAsJsonAsync(url, geminiRequest, JsonOptions);
+        response.EnsureSuccessStatusCode();
+
+        var result = await response.Content.ReadFromJsonAsync<GeminiResponse>(JsonOptions);
+
+        if (result?.Candidates is not { Count: > 0 })
+            return new ChatResponseDto("Não consegui processar sua mensagem. Tente novamente.", null);
+
+        var parts = result.Candidates[0].Content?.Parts;
+
+        if (parts is null || parts.Count == 0)
+            return new ChatResponseDto("Não entendi. Pode reformular?", null);
+
+        var functionCalls = parts.Where(p => p.FunctionCall is not null).ToList();
+        if (functionCalls.Count > 0)
+            return await ExecuteGeminiToolCalls(userId, functionCalls, contents, systemText, client, provider);
+
+        var text = string.Join("", parts.Where(p => p.Text is not null).Select(p => p.Text));
+        return new ChatResponseDto(
+            string.IsNullOrWhiteSpace(text) ? "Não entendi. Pode reformular?" : text, null);
+    }
+
+    private async Task<ChatResponseDto> ExecuteGeminiToolCalls(
+        Guid userId,
+        List<GeminiPart> functionCallParts,
+        List<object> contents,
+        string systemText,
+        HttpClient client,
+        ProviderConfig provider)
+    {
+        var actions = new List<ChatActionResult>();
+
+        var modelParts = functionCallParts.Select(p => (object)new
+        {
+            functionCall = new { name = p.FunctionCall!.Name, args = p.FunctionCall.Args }
+        }).ToList();
+
+        var responseParts = new List<object>();
+        foreach (var part in functionCallParts)
+        {
+            var fc = part.FunctionCall!;
+            var argsJson = fc.Args?.ValueKind == JsonValueKind.Object ? fc.Args.Value.GetRawText() : "{}";
+
+            _logger.LogInformation("Executando tool (Gemini): {Function} com args: {Args}", fc.Name, argsJson);
+
+            string toolResult;
+            try
+            {
+                toolResult = await ExecuteFunction(userId, fc.Name!, argsJson, actions);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro ao executar tool {Function}", fc.Name);
+                toolResult = $"Erro: {ex.Message}";
+                actions.Add(new ChatActionResult(fc.Name!, ex.Message, false));
+            }
+
+            responseParts.Add(new
+            {
+                functionResponse = new
+                {
+                    name = fc.Name,
+                    response = new { result = toolResult }
+                }
+            });
+        }
+
+        var followUpContents = new List<object>(contents);
+        followUpContents.Add(new { role = "model", parts = modelParts });
+        followUpContents.Add(new { role = "function", parts = responseParts });
+
+        var followUpRequest = new
+        {
+            systemInstruction = new { parts = new[] { new { text = systemText } } },
+            contents = followUpContents,
+            generationConfig = new { temperature = 0.3, maxOutputTokens = 1500 }
+        };
+
+        var url = $"{provider.BaseUrl}/models/{provider.Model}:generateContent?key={provider.ApiKey}";
+        var followUpResponse = await client.PostAsJsonAsync(url, followUpRequest, JsonOptions);
+
+        if (followUpResponse.IsSuccessStatusCode)
+        {
+            var followUpResult = await followUpResponse.Content
+                .ReadFromJsonAsync<GeminiResponse>(JsonOptions);
+            var replyText = followUpResult?.Candidates?.FirstOrDefault()?.Content?.Parts?
+                .Where(p => p.Text is not null)
+                .Select(p => p.Text)
+                .FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(replyText))
+                return new ChatResponseDto(replyText, actions);
+        }
+
+        var summary = string.Join("\n", actions.Select(a =>
+            a.Success ? $"✅ {a.Description}" : $"❌ {a.Description}"));
+        return new ChatResponseDto(
+            string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary, actions);
+    }
+
     private static DateOnly ParseDate(string dateStr) =>
         DateOnly.ParseExact(dateStr, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
 
@@ -257,11 +384,11 @@ public class ChatService : IChatService
             case "create_debt":
             {
                 var args = JsonSerializer.Deserialize<CreateDebtArgs>(argsJson, JsonOptions)!;
-                var dto = new CreateDebtDto(args.Description, args.Amount, ParseDate(args.DueDate), args.Notes);
+                var dto = new CreateDebtDto(args.Description, args.Amount, ParseDate(args.DueDate), args.Notes, args.Category);
                 var debt = await _debtService.CreateAsync(userId, dto);
                 actions.Add(new ChatActionResult("create_debt",
-                    $"Débito '{debt.Description}' R${debt.Amount:F2} venc. {debt.DueDate:dd/MM/yyyy}", true));
-                return $"Débito criado. ID: {debt.Id}, {debt.Description}, R${debt.Amount:F2}, venc. {debt.DueDate:dd/MM/yyyy}";
+                    $"Débito '{debt.Description}' R${debt.Amount:F2} venc. {debt.DueDate:dd/MM/yyyy} [{debt.Category}]", true));
+                return $"Débito criado. ID: {debt.Id}, {debt.Description}, R${debt.Amount:F2}, venc. {debt.DueDate:dd/MM/yyyy}, categoria: {debt.Category}";
             }
 
             case "create_recurring_debt":
@@ -270,7 +397,7 @@ public class ChatService : IChatService
                 var startDate = !string.IsNullOrEmpty(args.StartMonth)
                     ? ParseDate($"{args.StartMonth}-01")
                     : (DateOnly?)null;
-                var dto = new CreateRecurringDebtDto(args.Description, args.Amount, args.RecurringDay, args.Months, startDate, args.Notes);
+                var dto = new CreateRecurringDebtDto(args.Description, args.Amount, args.RecurringDay, args.Months, startDate, args.Notes, args.Category);
                 var debts = await _debtService.CreateRecurringAsync(userId, dto);
                 var count = debts.Count();
                 actions.Add(new ChatActionResult("create_recurring_debt",
@@ -286,7 +413,8 @@ public class ChatService : IChatService
                     args.Amount,
                     !string.IsNullOrEmpty(args.DueDate) ? ParseDate(args.DueDate) : null,
                     null,
-                    args.Notes);
+                    args.Notes,
+                    args.Category);
                 var debt = await _debtService.UpdateAsync(ParseGuidSafe(args.Id, "débito"), dto);
                 actions.Add(new ChatActionResult("edit_debt",
                     $"Débito '{debt.Description}' atualizado", true));
@@ -395,7 +523,7 @@ public class ChatService : IChatService
                 var cardId = await ResolveCreditCardIdAsync(userId, args.CreditCardId);
                 var dto = new CreateCardPurchaseDto(
                     cardId, args.Description, args.Amount,
-                    ParseDateTimeUtc(args.PurchaseDate), args.Installments, args.Notes);
+                    ParseDateTimeUtc(args.PurchaseDate), args.Installments, args.Notes, args.Category);
                 var purchase = await _cardPurchaseService.CreateAsync(dto);
                 actions.Add(new ChatActionResult("create_card_purchase",
                     $"Compra '{purchase.Description}' R${purchase.Amount:F2} em {purchase.Installments}x registrada", true));
@@ -411,7 +539,8 @@ public class ChatService : IChatService
                     !string.IsNullOrEmpty(args.PurchaseDate) ? ParseDateTimeUtc(args.PurchaseDate) : null,
                     args.Installments,
                     null,
-                    args.Notes);
+                    args.Notes,
+                    args.Category);
                 var purchase = await _cardPurchaseService.UpdateAsync(ParseGuidSafe(args.Id, "compra"), dto);
                 actions.Add(new ChatActionResult("edit_card_purchase",
                     $"Compra '{purchase.Description}' atualizada", true));
@@ -432,56 +561,101 @@ public class ChatService : IChatService
                 return result;
             }
 
+            case "list_all_card_purchases":
+            {
+                var cards = await _creditCardService.GetByUserIdAsync(userId);
+                if (!cards.Any())
+                {
+                    actions.Add(new ChatActionResult("list_all_card_purchases", "Nenhum cartão cadastrado", true));
+                    return "Nenhum cartão cadastrado.";
+                }
+
+                var sb = new System.Text.StringBuilder();
+                decimal grandTotal = 0;
+                foreach (var card in cards)
+                {
+                    var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id);
+                    var pendingList = purchases.ToList();
+                    if (pendingList.Count == 0) continue;
+
+                    var cardTotal = pendingList.Sum(p => p.Amount);
+                    grandTotal += cardTotal;
+                    sb.AppendLine($"📌 {card.Name} (final {card.LastFourDigits}) - Total pendente: R${cardTotal:F2}");
+                    foreach (var p in pendingList.Take(20))
+                        sb.AppendLine($"  - [ID: {p.Id}] {p.Description}: R${p.Amount:F2} ({p.CurrentInstallment}/{p.Installments}x) {p.PurchaseDate:dd/MM/yyyy}");
+                }
+
+                var result = sb.Length > 0
+                    ? $"Compras pendentes em todos os cartões (Total geral: R${grandTotal:F2}):\n{sb}"
+                    : "Nenhuma compra pendente em nenhum cartão.";
+                actions.Add(new ChatActionResult("list_all_card_purchases", "Listou compras de todos os cartões", true));
+                return result;
+            }
+
             default:
                 return $"Função '{functionName}' não reconhecida.";
         }
     }
 
-    private static List<object> BuildMessages(ChatRequestDto request, bool disableThinking)
+    private static string GetSystemPrompt(bool disableThinking)
     {
         var today = DateTime.UtcNow.ToString("yyyy-MM-dd");
         var currentMonth = DateTime.UtcNow.ToString("yyyy-MM");
         var noThink = disableThinking ? "\n/no_think" : "";
 
+        return $"""
+            Você é o Kash, assistente financeiro pessoal. Ajude o usuário a gerenciar débitos, recebíveis, cartões de crédito e compras.
+            Hoje é {today}. Mês atual: {currentMonth}. Ano atual: {DateTime.UtcNow.Year}.
+
+            REGRA PRINCIPAL DE CONFIRMAÇÃO:
+            - ANTES de executar qualquer ação que CRIA ou MODIFICA dados (criar débito, recebível, cartão, compra, editar qualquer coisa), você DEVE primeiro apresentar um resumo claro do que vai fazer e perguntar "Confirma?" ou similar.
+            - Só execute a ferramenta/tool quando o usuário confirmar com algo como "sim", "ok", "confirma", "pode fazer", "isso", "manda", "bora", etc.
+            - Se o usuário disser "não", "cancela", "errado", corrija ou pergunte o que mudar.
+            - Ações de LEITURA (listar débitos, listar cartões, etc.) podem ser executadas imediatamente sem confirmação.
+
+            REGRA DE LISTAGEM (OBRIGATÓRIA):
+            - Quando o usuário pedir para listar, ver, mostrar ou consultar itens (cartões, débitos, recebíveis, compras), você DEVE SEMPRE chamar a ferramenta correspondente (list_credit_cards, list_pending_debts, list_pending_receivables, list_card_purchases).
+            - NUNCA responda com base no histórico da conversa ou na sua memória. SEMPRE chame a ferramenta para buscar dados atualizados.
+            - Mesmo que você já tenha listado antes na mesma conversa, chame a ferramenta novamente.
+            - Ao apresentar o resultado de uma listagem, SEMPRE mostre TODOS os itens retornados pela ferramenta, um por um. NUNCA diga apenas "você tem X itens" sem listar quais são.
+
+            REGRA DE CONSULTA DE SALDO/LIMITE (OBRIGATÓRIA):
+            - Quando o usuário perguntar se pode comprar algo, quanto tem de limite, saldo disponível ou qualquer valor calculado, você DEVE chamar list_credit_cards ou list_card_purchases ANTES de responder.
+            - NUNCA faça cálculos de cabeça com valores do histórico da conversa. Os dados podem ter mudado.
+            - O limite disponível é: Limite total - Pendente (campo "Pendente" retornado pela ferramenta). Use APENAS esse valor.
+
+            REGRA DE VISÃO FINANCEIRA COMPLETA (OBRIGATÓRIA):
+            - Quando o usuário perguntar quanto está devendo, qual o total de dívidas, despesas do mês, ou pedir uma visão geral financeira, você DEVE chamar TANTO list_pending_debts QUANTO list_all_card_purchases para dar uma resposta completa.
+            - Débitos pendentes são contas a pagar (boletos, mensalidades, etc). Compras no cartão são despesas nos cartões de crédito.
+            - SEMPRE some os dois valores e apresente o total geral separado por categoria (débitos + cartões).
+            - Exemplo de resposta: "Para abril/2026 você tem: Débitos: R$1.250,00 | Cartões: R$800,00 | Total: R$2.050,00" seguido da lista detalhada.
+
+            Regras gerais:
+            - Se o usuário não informar o ano, assuma {DateTime.UtcNow.Year}.
+            - Se não informar o mês, assuma o mês atual ({currentMonth}).
+            - Valores devem ser números positivos.
+            - Datas no formato yyyy-MM-dd para as funções.
+            - Responda sempre em português brasileiro, de forma concisa e amigável.
+            - Use emojis moderadamente.
+            - Se o usuário pedir algo fora de finanças, diga educadamente que só trata de finanças.
+            - Para editar, o usuário pode referenciar itens pelo nome/descrição. Se ambíguo, liste os itens primeiro para ele escolher.
+            - Para compras no cartão, se o usuário não especificar qual cartão, liste os cartões disponíveis e peça para ele escolher.
+
+            REGRA DE CATEGORIZAÇÃO AUTOMÁTICA (OBRIGATÓRIA):
+            - Ao criar débitos ou compras no cartão, você DEVE sempre enviar o campo "category" com a categoria mais adequada.
+            - Categorias válidas: {string.Join(", ", ExpenseCategory.All)}.
+            - Escolha a categoria com base na descrição do gasto. Exemplos: "Almoco" → Alimentação, "Uber" → Transporte, "Netflix" → Assinaturas, "Aluguel" → Moradia, "Feira" → Mercado, "Dentista" → Saúde, "Presente namorada" → Presentes, "Ajuda mãe" → Família.
+            - Se não conseguir determinar, use "Outros".
+            - NÃO pergunte a categoria ao usuário. Deduza automaticamente pela descrição.
+            {noThink}
+            """;
+    }
+
+    private static List<object> BuildMessages(ChatRequestDto request, bool disableThinking)
+    {
         var messages = new List<object>
         {
-            new
-            {
-                role = "system",
-                content = $"""
-                    Você é o Kash, assistente financeiro pessoal. Ajude o usuário a gerenciar débitos, recebíveis, cartões de crédito e compras.
-                    Hoje é {today}. Mês atual: {currentMonth}. Ano atual: {DateTime.UtcNow.Year}.
-
-                    REGRA PRINCIPAL DE CONFIRMAÇÃO:
-                    - ANTES de executar qualquer ação que CRIA ou MODIFICA dados (criar débito, recebível, cartão, compra, editar qualquer coisa), você DEVE primeiro apresentar um resumo claro do que vai fazer e perguntar "Confirma?" ou similar.
-                    - Só execute a ferramenta/tool quando o usuário confirmar com algo como "sim", "ok", "confirma", "pode fazer", "isso", "manda", "bora", etc.
-                    - Se o usuário disser "não", "cancela", "errado", corrija ou pergunte o que mudar.
-                    - Ações de LEITURA (listar débitos, listar cartões, etc.) podem ser executadas imediatamente sem confirmação.
-
-                    REGRA DE LISTAGEM (OBRIGATÓRIA):
-                    - Quando o usuário pedir para listar, ver, mostrar ou consultar itens (cartões, débitos, recebíveis, compras), você DEVE SEMPRE chamar a ferramenta correspondente (list_credit_cards, list_pending_debts, list_pending_receivables, list_card_purchases).
-                    - NUNCA responda com base no histórico da conversa ou na sua memória. SEMPRE chame a ferramenta para buscar dados atualizados.
-                    - Mesmo que você já tenha listado antes na mesma conversa, chame a ferramenta novamente.
-                    - Ao apresentar o resultado de uma listagem, SEMPRE mostre TODOS os itens retornados pela ferramenta, um por um. NUNCA diga apenas "você tem X itens" sem listar quais são.
-
-                    REGRA DE CONSULTA DE SALDO/LIMITE (OBRIGATÓRIA):
-                    - Quando o usuário perguntar se pode comprar algo, quanto tem de limite, saldo disponível ou qualquer valor calculado, você DEVE chamar list_credit_cards ou list_card_purchases ANTES de responder.
-                    - NUNCA faça cálculos de cabeça com valores do histórico da conversa. Os dados podem ter mudado.
-                    - O limite disponível é: Limite total - Pendente (campo "Pendente" retornado pela ferramenta). Use APENAS esse valor.
-
-                    Regras gerais:
-                    - Se o usuário não informar o ano, assuma {DateTime.UtcNow.Year}.
-                    - Se não informar o mês, assuma o mês atual ({currentMonth}).
-                    - Valores devem ser números positivos.
-                    - Datas no formato yyyy-MM-dd para as funções.
-                    - Responda sempre em português brasileiro, de forma concisa e amigável.
-                    - Use emojis moderadamente.
-                    - Se o usuário pedir algo fora de finanças, diga educadamente que só trata de finanças.
-                    - Para editar, o usuário pode referenciar itens pelo nome/descrição. Se ambíguo, liste os itens primeiro para ele escolher.
-                    - Para compras no cartão, se o usuário não especificar qual cartão, liste os cartões disponíveis e peça para ele escolher.
-                    {noThink}
-                    """
-            }
+            new { role = "system", content = GetSystemPrompt(disableThinking) }
         };
 
         if (request.History is { Count: > 0 })
@@ -497,6 +671,26 @@ public class ChatService : IChatService
         return messages;
     }
 
+    private static (string systemText, List<object> contents) BuildGeminiContents(
+        ChatRequestDto request, bool disableThinking)
+    {
+        var systemText = GetSystemPrompt(disableThinking);
+        var contents = new List<object>();
+
+        if (request.History is { Count: > 0 })
+        {
+            foreach (var msg in request.History.TakeLast(30))
+            {
+                var role = msg.Role == "assistant" ? "model" : msg.Role;
+                contents.Add(new { role, parts = new[] { new { text = msg.Content } } });
+            }
+        }
+
+        contents.Add(new { role = "user", parts = new[] { new { text = request.Message } } });
+
+        return (systemText, contents);
+    }
+
     private static List<object> GetToolDefinitions() =>
     [
         // ─── DÉBITOS ───
@@ -508,8 +702,9 @@ public class ChatService : IChatService
                 ["amount"] = new { type = "number", description = "Valor em reais" },
                 ["due_date"] = new { type = "string", description = "Data de vencimento yyyy-MM-dd" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
+                ["category"] = new { type = "string", description = "Categoria do gasto (ex: Alimentação, Moradia, Transporte, Saúde, Lazer, Assinaturas, Mercado, Família, Outros)" },
             },
-            ["description", "amount", "due_date"]),
+            ["description", "amount", "due_date", "category"]),
 
         Tool("create_recurring_debt",
             "Cria débitos recorrentes mensais (ex: ajuda familiar, plano mensal). Gera N meses automaticamente.",
@@ -521,8 +716,9 @@ public class ChatService : IChatService
                 ["months"] = new { type = "integer", description = "Quantidade de meses (1-60)" },
                 ["start_month"] = new { type = "string", description = "Mês de início yyyy-MM (opcional, padrão mês atual)" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
+                ["category"] = new { type = "string", description = "Categoria do gasto" },
             },
-            ["description", "amount", "recurring_day", "months"]),
+            ["description", "amount", "recurring_day", "months", "category"]),
 
         Tool("edit_debt",
             "Edita um débito existente. Precisa do ID do débito. Só envie os campos que devem mudar.",
@@ -533,6 +729,7 @@ public class ChatService : IChatService
                 ["amount"] = new { type = "number", description = "Novo valor (opcional)" },
                 ["due_date"] = new { type = "string", description = "Nova data yyyy-MM-dd (opcional)" },
                 ["notes"] = new { type = "string", description = "Novas observações (opcional)" },
+                ["category"] = new { type = "string", description = "Nova categoria (opcional)" },
             },
             ["id"]),
 
@@ -621,8 +818,9 @@ public class ChatService : IChatService
                 ["purchase_date"] = new { type = "string", description = "Data da compra yyyy-MM-dd" },
                 ["installments"] = new { type = "integer", description = "Número de parcelas (1 = à vista)" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
+                ["category"] = new { type = "string", description = "Categoria da compra" },
             },
-            ["credit_card_id", "description", "amount", "purchase_date", "installments"]),
+            ["credit_card_id", "description", "amount", "purchase_date", "installments", "category"]),
 
         Tool("edit_card_purchase",
             "Edita uma compra de cartão existente. Precisa do ID.",
@@ -634,6 +832,7 @@ public class ChatService : IChatService
                 ["purchase_date"] = new { type = "string", description = "Nova data yyyy-MM-dd (opcional)" },
                 ["installments"] = new { type = "integer", description = "Novo nº de parcelas (opcional)" },
                 ["notes"] = new { type = "string", description = "Novas observações (opcional)" },
+                ["category"] = new { type = "string", description = "Nova categoria (opcional)" },
             },
             ["id"]),
 
@@ -644,6 +843,10 @@ public class ChatService : IChatService
                 ["credit_card_id"] = new { type = "string", description = "ID ou nome do cartão (ex: GUID ou 'Nubank')" },
             },
             ["credit_card_id"]),
+
+        Tool("list_all_card_purchases",
+            "Lista TODAS as compras pendentes de TODOS os cartões do usuário. Use quando precisar de uma visão geral das compras no cartão.",
+            new Dictionary<string, object>(), []),
     ];
 
     private static object Tool(string name, string description,
@@ -664,21 +867,33 @@ public class ChatService : IChatService
             }
         };
 
+    private static List<JsonElement> GetGeminiToolDeclarations()
+    {
+        var openAiTools = GetToolDefinitions();
+        var json = JsonSerializer.Serialize(openAiTools, JsonOptions);
+        using var doc = JsonDocument.Parse(json);
+        return doc.RootElement.EnumerateArray()
+            .Select(t => t.GetProperty("function").Clone())
+            .ToList();
+    }
+
     // ─── Argument records for JSON deserialization ───
     private record CreateDebtArgs(
         string Description, decimal Amount,
-        [property: JsonPropertyName("due_date")] string DueDate, string? Notes);
+        [property: JsonPropertyName("due_date")] string DueDate, string? Notes,
+        string? Category);
 
     private record CreateRecurringDebtArgs(
         string Description, decimal Amount,
         [property: JsonPropertyName("recurring_day")] int RecurringDay,
         int Months,
         [property: JsonPropertyName("start_month")] string? StartMonth,
-        string? Notes);
+        string? Notes, string? Category);
 
     private record EditDebtArgs(
         string Id, string? Description, decimal? Amount,
-        [property: JsonPropertyName("due_date")] string? DueDate, string? Notes);
+        [property: JsonPropertyName("due_date")] string? DueDate, string? Notes,
+        string? Category);
 
     private record CreateReceivableArgs(
         string Description, decimal Amount,
@@ -711,12 +926,12 @@ public class ChatService : IChatService
         [property: JsonPropertyName("credit_card_id")] string CreditCardId,
         string Description, decimal Amount,
         [property: JsonPropertyName("purchase_date")] string PurchaseDate,
-        int Installments, string? Notes);
+        int Installments, string? Notes, string? Category);
 
     private record EditCardPurchaseArgs(
         string Id, string? Description, decimal? Amount,
         [property: JsonPropertyName("purchase_date")] string? PurchaseDate,
-        int? Installments, string? Notes);
+        int? Installments, string? Notes, string? Category);
 
     private record ListCardPurchasesArgs(
         [property: JsonPropertyName("credit_card_id")] string CreditCardId);
@@ -742,3 +957,22 @@ record GroqToolCall(
 record GroqFunction(
     string? Name,
     string? Arguments);
+
+// Gemini API response models
+record GeminiResponse(
+    List<GeminiCandidate>? Candidates);
+
+record GeminiCandidate(
+    GeminiContent? Content);
+
+record GeminiContent(
+    string? Role,
+    List<GeminiPart>? Parts);
+
+record GeminiPart(
+    string? Text,
+    GeminiFunctionCall? FunctionCall);
+
+record GeminiFunctionCall(
+    string? Name,
+    JsonElement? Args);

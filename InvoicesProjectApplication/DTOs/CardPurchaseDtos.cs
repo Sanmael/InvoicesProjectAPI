@@ -10,6 +10,7 @@ public record CardPurchaseDto(
     int CurrentInstallment,
     bool IsPaid,
     string? Notes,
+    string Category,
     DateTime CreatedAt
 );
 
@@ -19,7 +20,8 @@ public record CreateCardPurchaseDto(
     decimal Amount,
     DateTime PurchaseDate,
     int Installments,
-    string? Notes
+    string? Notes,
+    string? Category = null
 );
 
 public record UpdateCardPurchaseDto(
@@ -28,5 +30,6 @@ public record UpdateCardPurchaseDto(
     DateTime? PurchaseDate,
     int? Installments,
     bool? IsPaid,
-    string? Notes
+    string? Notes,
+    string? Category = null
 );
