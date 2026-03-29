@@ -43,4 +43,14 @@ public class FinancialSummaryController : ControllerBase
         var summary = await _financialSummaryService.GetMonthlySummaryAsync(GetUserId(), year, month);
         return Ok(summary);
     }
+
+    /// <summary>
+    /// Obtém o score de saúde financeira do usuário
+    /// </summary>
+    [HttpGet("score")]
+    public async Task<ActionResult<FinancialScoreDto>> GetFinancialScore()
+    {
+        var score = await _financialSummaryService.GetFinancialScoreAsync(GetUserId());
+        return Ok(score);
+    }
 }

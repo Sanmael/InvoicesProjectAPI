@@ -18,4 +18,5 @@ public class User : BaseEntity
     public virtual ICollection<CreditCard> CreditCards { get; set; } = new List<CreditCard>();
     public virtual NotificationPreference? NotificationPreference { get; set; }
     public virtual ICollection<EmailNotification> EmailNotifications { get; set; } = new List<EmailNotification>();
+    public virtual ICollection<SavingsGoal> SavingsGoals { get; set; } = new List<SavingsGoal>();
 }

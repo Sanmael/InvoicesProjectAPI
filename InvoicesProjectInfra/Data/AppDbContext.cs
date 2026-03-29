@@ -17,6 +17,7 @@ public class AppDbContext : DbContext
     public DbSet<NotificationPreference> NotificationPreferences => Set<NotificationPreference>();
     public DbSet<EmailNotification> EmailNotifications => Set<EmailNotification>();
     public DbSet<EmailSettings> EmailSettings => Set<EmailSettings>();
+    public DbSet<SavingsGoal> SavingsGoals => Set<SavingsGoal>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -96,6 +97,8 @@ public class AppDbContext : DbContext
             entity.HasKey(e => e.Id);
             entity.Property(e => e.LowBalanceThreshold).HasPrecision(18, 2);
             entity.HasIndex(e => e.UserId).IsUnique();
+            entity.Property(e => e.TelegramUsername).HasMaxLength(100);
+            entity.Property(e => e.TelegramLinkToken).HasMaxLength(64);
 
             entity.HasOne(e => e.User)
                 .WithOne(u => u.NotificationPreference)
@@ -125,6 +128,21 @@ public class AppDbContext : DbContext
             entity.Property(e => e.SenderEmail).HasMaxLength(200).IsRequired();
             entity.Property(e => e.SenderName).HasMaxLength(200).IsRequired();
             entity.Property(e => e.EncryptedPassword).IsRequired();
+        });
+
+        modelBuilder.Entity<SavingsGoal>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Title).HasMaxLength(200).IsRequired();
+            entity.Property(e => e.Description).HasMaxLength(1000);
+            entity.Property(e => e.TargetAmount).HasPrecision(18, 2);
+            entity.Property(e => e.CurrentAmount).HasPrecision(18, 2);
+            entity.Property(e => e.Category).HasMaxLength(50).HasDefaultValue("Outros");
+
+            entity.HasOne(e => e.User)
+                .WithMany(u => u.SavingsGoals)
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

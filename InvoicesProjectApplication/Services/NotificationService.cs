@@ -17,6 +17,7 @@ public class NotificationService : INotificationService
     private readonly IReceivableRepository _receivableRepository;
     private readonly IUserRepository _userRepository;
     private readonly IEmailSenderService _emailSenderService;
+    private readonly ITelegramService? _telegramService;
     private readonly ILogger<NotificationService> _logger;
 
     public NotificationService(
@@ -29,6 +30,7 @@ public class NotificationService : INotificationService
         IReceivableRepository receivableRepository,
         IUserRepository userRepository,
         IEmailSenderService emailSenderService,
+        ITelegramService telegramService,
         ILogger<NotificationService> logger)
     {
         _preferenceRepository = preferenceRepository;
@@ -40,14 +42,22 @@ public class NotificationService : INotificationService
         _receivableRepository = receivableRepository;
         _userRepository = userRepository;
         _emailSenderService = emailSenderService;
+        _telegramService = telegramService;
         _logger = logger;
     }
 
     public async Task ProcessAllNotificationsAsync()
     {
-        var preferences = await _preferenceRepository.GetAllEnabledAsync();
+        var emailPrefs = await _preferenceRepository.GetAllEnabledAsync();
+        var telegramPrefs = await _preferenceRepository.GetAllTelegramEnabledAsync();
 
-        foreach (var pref in preferences)
+        // Unir usuários de ambos os canais (sem duplicar)
+        var allPrefs = emailPrefs
+            .Concat(telegramPrefs)
+            .DistinctBy(p => p.UserId)
+            .ToList();
+
+        foreach (var pref in allPrefs)
         {
             try
             {
@@ -64,7 +74,7 @@ public class NotificationService : INotificationService
     {
         var preference = await _preferenceRepository.GetByUserIdAsync(userId);
         
-        if (preference is null || !preference.EmailNotificationsEnabled)
+        if (preference is null || (!preference.EmailNotificationsEnabled && !preference.TelegramNotificationsEnabled))
         {
             _logger.LogInformation("Notificações desabilitadas para usuário {UserId}", userId);
             return;
@@ -294,13 +304,51 @@ public class NotificationService : INotificationService
 
         if (result.Success)
         {
-            _logger.LogInformation("Notificação {Type} enviada para {Email}", type, user.Email);
+            _logger.LogInformation("Notificação {Type} enviada por email para {Email}", type, user.Email);
         }
         else
         {
-            _logger.LogWarning("Falha ao enviar notificação {Type} para {Email}: {Error}", 
+            _logger.LogWarning("Falha ao enviar notificação {Type} por email para {Email}: {Error}", 
                 type, user.Email, result.ErrorMessage);
         }
+
+        // Enviar via Telegram se habilitado
+        if (_telegramService is not null)
+        {
+            var pref = await _preferenceRepository.GetByUserIdAsync(user.Id);
+            if (pref is { TelegramNotificationsEnabled: true, TelegramChatId: not null })
+            {
+                try
+                {
+                    var telegramText = $"<b>{subject}</b>\n\n{StripHtmlForTelegram(body)}";
+                    await _telegramService.SendMessageAsync(pref.TelegramChatId.Value, telegramText);
+                    _logger.LogInformation("Notificação {Type} enviada via Telegram para userId {UserId}", type, user.Id);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Falha ao enviar notificação {Type} via Telegram para userId {UserId}", type, user.Id);
+                }
+            }
+        }
+    }
+
+    private static string StripHtmlForTelegram(string html)
+    {
+        // Remove tags HTML não suportadas pelo Telegram, mantém <b>, <i>, <a>
+        var text = html;
+        // Remove tags de estilo/estrutura
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<br\s*/?>", "\n");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<p[^>]*>", "\n");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"</p>", "");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<div[^>]*>", "\n");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"</div>", "");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<h[1-6][^>]*>", "\n<b>");
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"</h[1-6]>", "</b>\n");
+        // Remove todas as tags restantes exceto b, i, a, code
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"<(?!/?(?:b|i|a|code)\b)[^>]+>", "");
+        // Limpa linhas em branco excessivas
+        text = System.Text.RegularExpressions.Regex.Replace(text, @"\n{3,}", "\n\n");
+        return text.Trim();
     }
 
     public async Task<IEnumerable<EmailNotificationDto>> GetNotificationHistoryAsync(Guid userId, int limit = 50)

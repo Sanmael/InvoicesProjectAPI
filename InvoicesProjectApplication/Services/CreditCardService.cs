@@ -18,6 +18,9 @@ public class CreditCardService : ICreditCardService
         _cardPurchaseRepository = cardPurchaseRepository;
     }
 
+    private static DateTime ParseDateTimeUtc(string dateStr) =>
+    DateTime.SpecifyKind(DateTime.Parse(dateStr), DateTimeKind.Utc);
+
     public async Task<CreditCardDto?> GetByIdAsync(Guid id)
     {
         var card = await _creditCardRepository.GetByIdAsync(id);
@@ -100,6 +103,63 @@ public class CreditCardService : ICreditCardService
     public async Task DeleteAsync(Guid id)
     {
         await _creditCardRepository.DeleteAsync(id);
+    }
+
+    public async Task<IEnumerable<BestCardRecommendationDto>> GetBestCardForTodayAsync(Guid userId)
+    {
+        var cards = await _creditCardRepository.GetActiveByUserIdAsync(userId);
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var recommendations = new List<BestCardRecommendationDto>();
+
+        foreach (var card in cards)
+        {
+            // Determine next closing date
+            DateOnly nextClosing;
+            if (today.Day <= card.ClosingDay)
+            {
+                // Purchase still goes on current invoice
+                nextClosing = new DateOnly(today.Year, today.Month, Math.Min(card.ClosingDay, DateTime.DaysInMonth(today.Year, today.Month)));
+            }
+            else
+            {
+                // Purchase goes on next month's invoice
+                var nextMonth = today.AddMonths(1);
+                nextClosing = new DateOnly(nextMonth.Year, nextMonth.Month, Math.Min(card.ClosingDay, DateTime.DaysInMonth(nextMonth.Year, nextMonth.Month)));
+            }
+
+            // Determine invoice due date (always after closing)
+            DateOnly dueDate;
+            if (card.DueDay > card.ClosingDay)
+            {
+                // Due date is in the same month as closing
+                dueDate = new DateOnly(nextClosing.Year, nextClosing.Month, Math.Min(card.DueDay, DateTime.DaysInMonth(nextClosing.Year, nextClosing.Month)));
+            }
+            else
+            {
+                // Due date is in the month after closing
+                var dueMonth = nextClosing.AddMonths(1);
+                dueDate = new DateOnly(dueMonth.Year, dueMonth.Month, Math.Min(card.DueDay, DateTime.DaysInMonth(dueMonth.Year, dueMonth.Month)));
+            }
+
+            var daysUntilPayment = dueDate.DayNumber - today.DayNumber;
+
+            var explanation = today.Day <= card.ClosingDay
+                ? $"Compra entra na fatura atual (fecha dia {card.ClosingDay}), vence em {dueDate:dd/MM/yyyy} — {daysUntilPayment} dias de prazo."
+                : $"Compra entra na próxima fatura (fecha dia {card.ClosingDay}), vence em {dueDate:dd/MM/yyyy} — {daysUntilPayment} dias de prazo.";
+
+            recommendations.Add(new BestCardRecommendationDto(
+                card.Id,
+                card.Name,
+                card.LastFourDigits,
+                card.ClosingDay,
+                card.DueDay,
+                daysUntilPayment,
+                nextClosing,
+                dueDate,
+                explanation));
+        }
+
+        return recommendations.OrderByDescending(r => r.DaysUntilPayment);
     }
 
     private static CreditCardDto MapToDto(CreditCard card, decimal totalPending)

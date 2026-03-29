@@ -64,6 +64,26 @@ public class NotificationPreference : BaseEntity
     /// Se as notificações por email estão habilitadas para este usuário
     /// </summary>
     public bool EmailNotificationsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Chat ID do Telegram vinculado ao usuário
+    /// </summary>
+    public long? TelegramChatId { get; set; }
+
+    /// <summary>
+    /// Username do Telegram
+    /// </summary>
+    public string? TelegramUsername { get; set; }
+
+    /// <summary>
+    /// Token temporário usado para vincular conta do Telegram
+    /// </summary>
+    public string? TelegramLinkToken { get; set; }
+
+    /// <summary>
+    /// Se as notificações por Telegram estão habilitadas
+    /// </summary>
+    public bool TelegramNotificationsEnabled { get; set; } = false;
     
     // Navigation property
     public virtual User User { get; set; } = null!;

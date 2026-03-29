@@ -93,4 +93,14 @@ public class CreditCardsController : ControllerBase
         await _creditCardService.DeleteAsync(id);
         return NoContent();
     }
+
+    /// <summary>
+    /// Recomendação: melhor cartão para comprar hoje (maior prazo de pagamento)
+    /// </summary>
+    [HttpGet("best-today")]
+    public async Task<ActionResult<IEnumerable<BestCardRecommendationDto>>> GetBestCardForToday()
+    {
+        var recommendations = await _creditCardService.GetBestCardForTodayAsync(GetUserId());
+        return Ok(recommendations);
+    }
 }

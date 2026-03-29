@@ -110,4 +110,26 @@ public class CardPurchasesController : ControllerBase
         await _cardPurchaseService.DeleteAsync(id);
         return NoContent();
     }
+
+    /// <summary>
+    /// Simula antecipação de parcelas com desconto
+    /// </summary>
+    [HttpPost("{id:guid}/simulate-anticipation")]
+    public async Task<ActionResult<AnticipationSimulationDto>> SimulateAnticipation(
+        Guid id, [FromBody] AnticipationSimulationRequestDto dto)
+    {
+        try
+        {
+            var simulation = await _cardPurchaseService.SimulateAnticipationAsync(id, dto.MonthlyDiscountRate);
+            return Ok(simulation);
+        }
+        catch (KeyNotFoundException)
+        {
+            return NotFound();
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
 }

@@ -34,6 +34,7 @@ public static class DependencyInjection
         services.AddScoped<INotificationPreferenceRepository, NotificationPreferenceRepository>();
         services.AddScoped<IEmailNotificationRepository, EmailNotificationRepository>();
         services.AddScoped<IEmailSettingsRepository, EmailSettingsRepository>();
+        services.AddScoped<ISavingsGoalRepository, SavingsGoalRepository>();
 
         // Services
         services.AddScoped<IPasswordHasher, PasswordHasher>();
@@ -52,6 +53,10 @@ public static class DependencyInjection
         services.AddScoped<IEmailSettingsService, EmailSettingsService>();
         services.AddScoped<INotificationService, NotificationService>();
         services.AddScoped<IChatService, ChatService>();
+        services.AddScoped<ISavingsGoalService, SavingsGoalService>();
+        services.AddScoped<IDocumentImportService, DocumentImportService>();
+        services.AddScoped<IBankImportService, BankImportService>();
+        services.AddScoped<ITelegramService, TelegramService>();
         services.AddHttpClient("ChatProvider");
         services.AddHostedService<NotificationProcessingHostedService>();
 

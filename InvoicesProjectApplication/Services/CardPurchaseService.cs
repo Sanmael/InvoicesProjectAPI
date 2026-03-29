@@ -106,6 +106,53 @@ public class CardPurchaseService : ICardPurchaseService
         return MapToDto(purchase);
     }
 
+    public async Task<AnticipationSimulationDto> SimulateAnticipationAsync(Guid purchaseId, decimal monthlyDiscountRate)
+    {
+        var purchase = await _cardPurchaseRepository.GetByIdAsync(purchaseId)
+            ?? throw new KeyNotFoundException("Compra não encontrada.");
+
+        if (purchase.Installments <= 1)
+            throw new InvalidOperationException("Compra à vista não possui parcelas para antecipar.");
+
+        var remainingInstallments = purchase.Installments - purchase.CurrentInstallment;
+        if (remainingInstallments <= 0)
+            throw new InvalidOperationException("Todas as parcelas já foram pagas.");
+
+        var installmentValue = purchase.Amount / purchase.Installments;
+        var rate = monthlyDiscountRate / 100m;
+        var installments = new List<AnticipationInstallmentDto>();
+        decimal totalDiscounted = 0;
+
+        for (int i = 1; i <= remainingInstallments; i++)
+        {
+            var discountedValue = installmentValue / (decimal)Math.Pow((double)(1 + rate), i);
+            discountedValue = Math.Round(discountedValue, 2);
+            var savings = installmentValue - discountedValue;
+
+            installments.Add(new AnticipationInstallmentDto(
+                purchase.CurrentInstallment + i,
+                installmentValue,
+                discountedValue,
+                Math.Round(savings, 2)));
+
+            totalDiscounted += discountedValue;
+        }
+
+        var totalRemaining = installmentValue * remainingInstallments;
+
+        return new AnticipationSimulationDto(
+            purchase.Id,
+            purchase.Description,
+            purchase.Installments,
+            remainingInstallments,
+            Math.Round(installmentValue, 2),
+            Math.Round(totalRemaining, 2),
+            Math.Round(totalDiscounted, 2),
+            Math.Round(totalRemaining - totalDiscounted, 2),
+            monthlyDiscountRate,
+            installments);
+    }
+
     private static CardPurchaseDto MapToDto(CardPurchase purchase) =>
         new(purchase.Id, purchase.CreditCardId, purchase.Description, purchase.Amount,
             purchase.PurchaseDate, purchase.Installments, purchase.CurrentInstallment,

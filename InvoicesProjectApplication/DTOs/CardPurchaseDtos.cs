@@ -5,7 +5,7 @@ public record CardPurchaseDto(
     Guid CreditCardId,
     string Description,
     decimal Amount,
-    DateTime PurchaseDate,
+    DateOnly PurchaseDate,
     int Installments,
     int CurrentInstallment,
     bool IsPaid,
@@ -18,7 +18,7 @@ public record CreateCardPurchaseDto(
     Guid CreditCardId,
     string Description,
     decimal Amount,
-    DateTime PurchaseDate,
+    DateOnly PurchaseDate,
     int Installments,
     string? Notes,
     string? Category = null
@@ -27,7 +27,7 @@ public record CreateCardPurchaseDto(
 public record UpdateCardPurchaseDto(
     string? Description,
     decimal? Amount,
-    DateTime? PurchaseDate,
+    DateOnly? PurchaseDate,
     int? Installments,
     bool? IsPaid,
     string? Notes,

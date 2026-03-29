@@ -11,4 +11,5 @@ public interface ICardPurchaseService
     Task<CardPurchaseDto> UpdateAsync(Guid id, UpdateCardPurchaseDto dto);
     Task DeleteAsync(Guid id);
     Task<CardPurchaseDto> MarkAsPaidAsync(Guid id);
+    Task<AnticipationSimulationDto> SimulateAnticipationAsync(Guid purchaseId, decimal monthlyDiscountRate);
 }

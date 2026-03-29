@@ -13,4 +13,8 @@ public interface INotificationPreferenceRepository : IRepository<NotificationPre
     /// Obtém todos os usuários com notificações habilitadas
     /// </summary>
     Task<IEnumerable<NotificationPreference>> GetAllEnabledAsync();
+
+    Task<NotificationPreference?> GetByLinkTokenAsync(string token);
+    Task<NotificationPreference?> GetByChatIdAsync(long chatId);
+    Task<IEnumerable<NotificationPreference>> GetAllTelegramEnabledAsync();
 }

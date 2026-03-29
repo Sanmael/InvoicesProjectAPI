@@ -25,6 +25,7 @@ public class ChatService : IChatService
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNameCaseInsensitive = true,
+        NumberHandling = JsonNumberHandling.AllowReadingFromString,
     };
 
     private record ProviderConfig(
@@ -135,11 +136,23 @@ public class ChatService : IChatService
 
         var client = _httpClientFactory.CreateClient("ChatProvider");
         client.DefaultRequestHeaders.Clear();
+        
         client.DefaultRequestHeaders.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", provider.ApiKey);
 
         var response = await client.PostAsJsonAsync(provider.BaseUrl, chatRequest, JsonOptions);
-        response.EnsureSuccessStatusCode();
+
+        // If Groq rejects the LLM's tool call (e.g. number sent as string), retry without tools
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorBody = await response.Content.ReadAsStringAsync();
+            if (errorBody.Contains("tool_use_failed") || errorBody.Contains("tool call validation failed"))
+            {
+                _logger.LogWarning("Tool call validation failed, retrying without tools: {Error}", errorBody);
+                return await CallProviderWithoutTools(messages, client, provider);
+            }
+            response.EnsureSuccessStatusCode(); // throw for other errors
+        }
 
         var result = await response.Content.ReadFromJsonAsync<GroqChatResponse>(JsonOptions);
 
@@ -148,13 +161,31 @@ public class ChatService : IChatService
 
         var choice = result.Choices[0];
 
-        if (choice.Message?.ToolCalls is { Count: > 0 })
-        {
+        if (choice.Message?.ToolCalls is { Count: > 0 })        
             return await ExecuteToolCalls(userId, choice.Message.ToolCalls, messages, client, provider);
-        }
-
+        
         return new ChatResponseDto(
             choice.Message?.Content ?? "Não entendi. Pode reformular?", null);
+    }
+
+    private async Task<ChatResponseDto> CallProviderWithoutTools(
+        List<object> messages, HttpClient client, ProviderConfig provider)
+    {
+        var retryRequest = new
+        {
+            model = provider.Model,
+            messages,
+            temperature = 0.3,
+            max_tokens = 1500,
+        };
+
+        var retryResponse = await client.PostAsJsonAsync(provider.BaseUrl, retryRequest, JsonOptions);
+        retryResponse.EnsureSuccessStatusCode();
+
+        var retryResult = await retryResponse.Content.ReadFromJsonAsync<GroqChatResponse>(JsonOptions);
+        var reply = retryResult?.Choices?.FirstOrDefault()?.Message?.Content;
+
+        return new ChatResponseDto(reply ?? "Não consegui processar sua mensagem. Tente novamente.", null);
     }
 
     private async Task<ChatResponseDto> ExecuteToolCalls(
@@ -166,6 +197,7 @@ public class ChatService : IChatService
     {
         var actions = new List<ChatActionResult>();
         var toolMessages = new List<object>();
+        string? planPayload = null;
 
         foreach (var toolCall in toolCalls)
         {
@@ -175,10 +207,12 @@ public class ChatService : IChatService
             _logger.LogInformation("Executando tool: {Function} com args: {Args}", functionName, argsJson);
 
             string toolResult;
+
             try
             {
                 toolResult = await ExecuteFunction(userId, functionName, argsJson, actions);
             }
+
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Erro ao executar tool {Function}", functionName);
@@ -186,10 +220,15 @@ public class ChatService : IChatService
                 actions.Add(new ChatActionResult(functionName, ex.Message, false));
             }
 
-            toolMessages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = toolResult });
+            // Intercept purchase plan - don't send raw JSON to LLM
+            planPayload ??= ExtractPlanPayload(toolResult);
+            var contentForLlm = StripPlanMarkers(toolResult);
+
+            toolMessages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = contentForLlm });
         }
 
         var followUp = new List<object>(messages);
+        
         followUp.Add(new
         {
             role = "assistant",
@@ -200,6 +239,7 @@ public class ChatService : IChatService
                 function = new { name = tc.Function?.Name, arguments = tc.Function?.Arguments }
             })
         });
+
         followUp.AddRange(toolMessages);
 
         var followUpRequest = new
@@ -217,15 +257,25 @@ public class ChatService : IChatService
         {
             var followUpResult = await followUpResponse.Content
                 .ReadFromJsonAsync<GroqChatResponse>(JsonOptions);
+
             var reply = followUpResult?.Choices?.FirstOrDefault()?.Message?.Content;
+
             if (!string.IsNullOrWhiteSpace(reply))
+            {
+                if (planPayload is not null)
+                    reply += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
                 return new ChatResponseDto(reply, actions);
+            }
         }
 
         var summary = string.Join("\n", actions.Select(a =>
             a.Success ? $"✅ {a.Description}" : $"❌ {a.Description}"));
-        return new ChatResponseDto(
-            string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary, actions);
+
+        var fallback = string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
+        if (planPayload is not null)
+            fallback += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
+
+        return new ChatResponseDto(fallback, actions);
     }
 
     // ─── GEMINI PROVIDER ───
@@ -315,9 +365,36 @@ public class ChatService : IChatService
             });
         }
 
+        // Extract plan payload before sending to LLM
+        string? planPayload = null;
+        var cleanedResponseParts = new List<object>();
+        foreach (var rp in responseParts)
+        {
+            var rpJson = JsonSerializer.Serialize(rp, JsonOptions);
+            using var rpDoc = JsonDocument.Parse(rpJson);
+            var resultStr = rpDoc.RootElement
+                .GetProperty("function_response")
+                .GetProperty("response")
+                .GetProperty("result")
+                .GetString() ?? "";
+
+            planPayload ??= ExtractPlanPayload(resultStr);
+            var cleanResult = StripPlanMarkers(resultStr);
+
+            var frName = rpDoc.RootElement.GetProperty("function_response").GetProperty("name").GetString();
+            cleanedResponseParts.Add(new
+            {
+                functionResponse = new
+                {
+                    name = frName,
+                    response = new { result = cleanResult }
+                }
+            });
+        }
+
         var followUpContents = new List<object>(contents);
         followUpContents.Add(new { role = "model", parts = modelParts });
-        followUpContents.Add(new { role = "function", parts = responseParts });
+        followUpContents.Add(new { role = "function", parts = cleanedResponseParts });
 
         var followUpRequest = new
         {
@@ -338,20 +415,42 @@ public class ChatService : IChatService
                 .Select(p => p.Text)
                 .FirstOrDefault();
             if (!string.IsNullOrWhiteSpace(replyText))
+            {
+                if (planPayload is not null)
+                    replyText += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
                 return new ChatResponseDto(replyText, actions);
+            }
         }
 
         var summary = string.Join("\n", actions.Select(a =>
             a.Success ? $"✅ {a.Description}" : $"❌ {a.Description}"));
-        return new ChatResponseDto(
-            string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary, actions);
+        var fallback = string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
+        if (planPayload is not null)
+            fallback += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
+        return new ChatResponseDto(fallback, actions);
+    }
+
+    private const string PlanStart = "<!--PURCHASE_PLAN-->";
+    private const string PlanEnd = "<!--/PURCHASE_PLAN-->";
+
+    private static string? ExtractPlanPayload(string text)
+    {
+        var startIdx = text.IndexOf(PlanStart, StringComparison.Ordinal);
+        var endIdx = text.IndexOf(PlanEnd, StringComparison.Ordinal);
+        if (startIdx < 0 || endIdx < 0) return null;
+        return text[(startIdx + PlanStart.Length)..endIdx];
+    }
+
+    private static string StripPlanMarkers(string text)
+    {
+        var startIdx = text.IndexOf(PlanStart, StringComparison.Ordinal);
+        var endIdx = text.IndexOf(PlanEnd, StringComparison.Ordinal);
+        if (startIdx < 0 || endIdx < 0) return text;
+        return (text[..startIdx] + "Plano de compra gerado com sucesso. Apresente um breve resumo ao usuário." + text[(endIdx + PlanEnd.Length)..]).Trim();
     }
 
     private static DateOnly ParseDate(string dateStr) =>
         DateOnly.ParseExact(dateStr, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
-
-    private static DateTime ParseDateTimeUtc(string dateStr) =>
-        DateTime.SpecifyKind(DateTime.Parse(dateStr), DateTimeKind.Utc);
 
     private async Task<Guid> ResolveCreditCardIdAsync(Guid userId, string identifier)
     {
@@ -424,13 +523,25 @@ public class ChatService : IChatService
             case "list_pending_debts":
             {
                 var debts = await _debtService.GetPendingByUserIdAsync(userId);
-                var list = debts.Take(15).Select(d =>
-                    $"- [ID: {d.Id}] {d.Description}: R${d.Amount:F2} (venc. {d.DueDate:dd/MM/yyyy})");
-                var result = list.Any()
-                    ? $"Débitos pendentes:\n{string.Join("\n", list)}"
-                    : "Nenhum débito pendente.";
+                var debtList = debts.ToList();
+                if (debtList.Count == 0)
+                {
+                    actions.Add(new ChatActionResult("list_pending_debts", "Listou débitos pendentes", true));
+                    return "Nenhum débito pendente.";
+                }
+                var grouped = debtList.GroupBy(d => d.DueDate.ToString("yyyy-MM")).OrderBy(g => g.Key);
+                string[] mn = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+                var sb = new System.Text.StringBuilder("Débitos pendentes por mês:\n");
+                foreach (var g in grouped)
+                {
+                    var parts = g.Key.Split('-');
+                    var monthTotal = g.Sum(d => d.Amount);
+                    sb.AppendLine($"📅 {mn[int.Parse(parts[1])]}/{parts[0]} (total: R${monthTotal:F2}):");
+                    foreach (var d in g.Take(15))
+                        sb.AppendLine($"  - [ID: {d.Id}] {d.Description}: R${d.Amount:F2} (venc. {d.DueDate:dd/MM/yyyy})");
+                }
                 actions.Add(new ChatActionResult("list_pending_debts", "Listou débitos pendentes", true));
-                return result;
+                return sb.ToString();
             }
 
             // ─── RECEBÍVEIS ───
@@ -473,13 +584,25 @@ public class ChatService : IChatService
             case "list_pending_receivables":
             {
                 var receivables = await _receivableService.GetPendingByUserIdAsync(userId);
-                var list = receivables.Take(15).Select(r =>
-                    $"- [ID: {r.Id}] {r.Description}: R${r.Amount:F2} (previsão {r.ExpectedDate:dd/MM/yyyy})");
-                var result = list.Any()
-                    ? $"Recebíveis pendentes:\n{string.Join("\n", list)}"
-                    : "Nenhum recebível pendente.";
+                var recList = receivables.ToList();
+                if (recList.Count == 0)
+                {
+                    actions.Add(new ChatActionResult("list_pending_receivables", "Listou recebíveis pendentes", true));
+                    return "Nenhum recebível pendente.";
+                }
+                var grouped = recList.GroupBy(r => r.ExpectedDate.ToString("yyyy-MM")).OrderBy(g => g.Key);
+                string[] mn = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+                var sb = new System.Text.StringBuilder("Recebíveis pendentes por mês:\n");
+                foreach (var g in grouped)
+                {
+                    var parts = g.Key.Split('-');
+                    var monthTotal = g.Sum(r => r.Amount);
+                    sb.AppendLine($"📅 {mn[int.Parse(parts[1])]}/{parts[0]} (total: R${monthTotal:F2}):");
+                    foreach (var r in g.Take(15))
+                        sb.AppendLine($"  - [ID: {r.Id}] {r.Description}: R${r.Amount:F2} (previsão {r.ExpectedDate:dd/MM/yyyy}){(r.IsRecurring ? " 🔄 recorrente" : "")}");
+                }
                 actions.Add(new ChatActionResult("list_pending_receivables", "Listou recebíveis pendentes", true));
-                return result;
+                return sb.ToString();
             }
 
             // ─── CARTÕES DE CRÉDITO ───
@@ -523,7 +646,7 @@ public class ChatService : IChatService
                 var cardId = await ResolveCreditCardIdAsync(userId, args.CreditCardId);
                 var dto = new CreateCardPurchaseDto(
                     cardId, args.Description, args.Amount,
-                    ParseDateTimeUtc(args.PurchaseDate), args.Installments, args.Notes, args.Category);
+                    ParseDate(args.PurchaseDate), args.Installments, args.Notes, args.Category);
                 var purchase = await _cardPurchaseService.CreateAsync(dto);
                 actions.Add(new ChatActionResult("create_card_purchase",
                     $"Compra '{purchase.Description}' R${purchase.Amount:F2} em {purchase.Installments}x registrada", true));
@@ -536,7 +659,7 @@ public class ChatService : IChatService
                 var dto = new UpdateCardPurchaseDto(
                     args.Description,
                     args.Amount,
-                    !string.IsNullOrEmpty(args.PurchaseDate) ? ParseDateTimeUtc(args.PurchaseDate) : null,
+                    !string.IsNullOrEmpty(args.PurchaseDate) ? ParseDate(args.PurchaseDate) : null,
                     args.Installments,
                     null,
                     args.Notes,
@@ -571,22 +694,53 @@ public class ChatService : IChatService
                 }
 
                 var sb = new System.Text.StringBuilder();
-                decimal grandTotal = 0;
+                var monthlyTotals = new SortedDictionary<string, decimal>();
+                decimal grandTotalRemaining = 0;
+
                 foreach (var card in cards)
                 {
                     var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id);
                     var pendingList = purchases.ToList();
                     if (pendingList.Count == 0) continue;
 
-                    var cardTotal = pendingList.Sum(p => p.Amount);
-                    grandTotal += cardTotal;
-                    sb.AppendLine($"📌 {card.Name} (final {card.LastFourDigits}) - Total pendente: R${cardTotal:F2}");
+                    sb.AppendLine($"📌 {card.Name} (final {card.LastFourDigits}, fecha dia {card.ClosingDay}, vence dia {card.DueDay}):");
                     foreach (var p in pendingList.Take(20))
-                        sb.AppendLine($"  - [ID: {p.Id}] {p.Description}: R${p.Amount:F2} ({p.CurrentInstallment}/{p.Installments}x) {p.PurchaseDate:dd/MM/yyyy}");
+                    {
+                        var remaining = p.Installments - p.CurrentInstallment + 1;
+                        sb.AppendLine($"  - [ID: {p.Id}] {p.Description}: R${p.Amount:F2}/parcela ({p.CurrentInstallment}/{p.Installments}x, restam {remaining}) compra {p.PurchaseDate:dd/MM/yyyy}");
+
+                        // Calculate billing month for each remaining installment
+                        var firstBillingMonth = p.PurchaseDate.Day <= card.ClosingDay
+                            ? new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1)
+                            : new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1).AddMonths(1);
+
+                        for (int inst = p.CurrentInstallment; inst <= p.Installments; inst++)
+                        {
+                            var billingMonth = firstBillingMonth.AddMonths(inst - 1);
+                            var key = billingMonth.ToString("yyyy-MM");
+                            monthlyTotals.TryAdd(key, 0);
+                            monthlyTotals[key] += p.Amount;
+                        }
+                        grandTotalRemaining += p.Amount * remaining;
+                    }
+                }
+
+                if (monthlyTotals.Count > 0)
+                {
+                    string[] monthNames = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+                    sb.AppendLine();
+                    sb.AppendLine("📊 Projeção mensal de faturas de cartão (valor que cai na fatura de cada mês):");
+                    foreach (var (month, total) in monthlyTotals)
+                    {
+                        var parts = month.Split('-');
+                        var monthNum = int.Parse(parts[1]);
+                        sb.AppendLine($"  {monthNames[monthNum]}/{parts[0]}: R${total:F2}");
+                    }
+                    sb.AppendLine($"  Total restante (todas parcelas futuras): R${grandTotalRemaining:F2}");
                 }
 
                 var result = sb.Length > 0
-                    ? $"Compras pendentes em todos os cartões (Total geral: R${grandTotal:F2}):\n{sb}"
+                    ? $"Compras pendentes em todos os cartões:\n{sb}"
                     : "Nenhuma compra pendente em nenhum cartão.";
                 actions.Add(new ChatActionResult("list_all_card_purchases", "Listou compras de todos os cartões", true));
                 return result;
@@ -594,6 +748,16 @@ public class ChatService : IChatService
 
             default:
                 return $"Função '{functionName}' não reconhecida.";
+
+            // ─── PLANEJAMENTO DE COMPRA ───
+            case "generate_purchase_plan":
+            {
+                var args = JsonSerializer.Deserialize<GeneratePurchasePlanArgs>(argsJson, JsonOptions)!;
+                var plan = await BuildPurchasePlan(userId, args);
+                var planJson = JsonSerializer.Serialize(plan, JsonOptions);
+                actions.Add(new ChatActionResult("generate_purchase_plan", $"Plano de compra gerado: {args.ProductName}", true));
+                return $"<!--PURCHASE_PLAN-->{planJson}<!--/PURCHASE_PLAN-->";
+            }
         }
     }
 
@@ -625,16 +789,25 @@ public class ChatService : IChatService
             - O limite disponível é: Limite total - Pendente (campo "Pendente" retornado pela ferramenta). Use APENAS esse valor.
 
             REGRA DE VISÃO FINANCEIRA COMPLETA (OBRIGATÓRIA):
-            - Quando o usuário perguntar quanto está devendo, qual o total de dívidas, despesas do mês, ou pedir uma visão geral financeira, você DEVE chamar TANTO list_pending_debts QUANTO list_all_card_purchases para dar uma resposta completa.
-            - Débitos pendentes são contas a pagar (boletos, mensalidades, etc). Compras no cartão são despesas nos cartões de crédito.
-            - SEMPRE some os dois valores e apresente o total geral separado por categoria (débitos + cartões).
-            - Exemplo de resposta: "Para abril/2026 você tem: Débitos: R$1.250,00 | Cartões: R$800,00 | Total: R$2.050,00" seguido da lista detalhada.
+                        - Quando o usuário perguntar quanto está devendo, qual o total de dívidas, despesas do mês, ou pedir uma visão geral financeira, você DEVE chamar list_pending_debts, list_all_card_purchases e list_pending_receivables para dar uma resposta completa.
+                        - list_all_card_purchases retorna no final uma "Projeção mensal de faturas de cartão" com o valor EXATO que cai na fatura de CADA MÊS. Use APENAS o valor do mês em questão, NÃO some o total geral de todas as parcelas futuras como se fosse gasto de um mês só.
+                        - Débitos pendentes: filtre pelo vencimento do mês em questão. Compras no cartão: use o valor do mês da projeção. Recebíveis: filtre pela data prevista do mês.
+                        - SEMPRE calcule saldo_livre do mês = recebiveis_do_mês - (debitos_do_mês + cartoes_do_mês).
+                        - Exemplo: "Abril/2026: Recebíveis R$12.300 | Débitos R$1.691,74 | Cartões R$1.986,72 | Saídas R$3.678,46 | Saldo livre R$8.621,54"
+
+                        REGRA DE PLANEJAMENTO DE COMPRA E META (OBRIGATÓRIA):
+                        - Quando o usuário pedir "melhor forma de comprar" algo, comparar à vista vs parcelado, simular compra, ou perguntar se consegue manter meta de economia, você DEVE chamar a ferramenta generate_purchase_plan.
+                        - Extraia do pedido: nome do produto, preço total, desconto PIX (padrão 10%), meta de economia (se mencionada), mês de início.
+                        - Se faltar o preço do produto, peça ao usuário. Os demais campos são opcionais.
+                        - NÃO faça cálculos manuais. A ferramenta faz toda a projeção e gera a visualização automaticamente.
+                        - Após chamar a ferramenta, dê um resumo breve e amigável da recomendação ao usuário. O detalhamento completo com tabelas e cenários será exibido visualmente pelo sistema.
 
             Regras gerais:
             - Se o usuário não informar o ano, assuma {DateTime.UtcNow.Year}.
             - Se não informar o mês, assuma o mês atual ({currentMonth}).
             - Valores devem ser números positivos.
             - Datas no formato yyyy-MM-dd para as funções.
+            - IMPORTANTE: ao chamar ferramentas, valores numéricos (amount, total_price, credit_limit, etc.) DEVEM ser enviados como números JSON (ex: 5000), NUNCA como strings entre aspas (ex: "5000").
             - Responda sempre em português brasileiro, de forma concisa e amigável.
             - Use emojis moderadamente.
             - Se o usuário pedir algo fora de finanças, diga educadamente que só trata de finanças.
@@ -699,7 +872,7 @@ public class ChatService : IChatService
             new Dictionary<string, object>
             {
                 ["description"] = new { type = "string", description = "Descrição do débito" },
-                ["amount"] = new { type = "number", description = "Valor em reais" },
+                ["amount"] = new { type = "number", description = "Valor em reais (número, ex: 5000)" },
                 ["due_date"] = new { type = "string", description = "Data de vencimento yyyy-MM-dd" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
                 ["category"] = new { type = "string", description = "Categoria do gasto (ex: Alimentação, Moradia, Transporte, Saúde, Lazer, Assinaturas, Mercado, Família, Outros)" },
@@ -711,7 +884,7 @@ public class ChatService : IChatService
             new Dictionary<string, object>
             {
                 ["description"] = new { type = "string", description = "Descrição" },
-                ["amount"] = new { type = "number", description = "Valor mensal em reais" },
+                ["amount"] = new { type = "number", description = "Valor mensal em reais (número, ex: 1500)" },
                 ["recurring_day"] = new { type = "integer", description = "Dia do mês (1-28)" },
                 ["months"] = new { type = "integer", description = "Quantidade de meses (1-60)" },
                 ["start_month"] = new { type = "string", description = "Mês de início yyyy-MM (opcional, padrão mês atual)" },
@@ -743,7 +916,7 @@ public class ChatService : IChatService
             new Dictionary<string, object>
             {
                 ["description"] = new { type = "string", description = "Descrição do recebível" },
-                ["amount"] = new { type = "number", description = "Valor em reais" },
+                ["amount"] = new { type = "number", description = "Valor em reais (número, ex: 3000)" },
                 ["expected_date"] = new { type = "string", description = "Data prevista yyyy-MM-dd" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
             },
@@ -754,7 +927,7 @@ public class ChatService : IChatService
             new Dictionary<string, object>
             {
                 ["description"] = new { type = "string", description = "Descrição" },
-                ["amount"] = new { type = "number", description = "Valor mensal em reais" },
+                ["amount"] = new { type = "number", description = "Valor mensal em reais (número, ex: 8000)" },
                 ["recurring_day"] = new { type = "integer", description = "Dia do mês (1-28)" },
                 ["months"] = new { type = "integer", description = "Quantidade de meses (1-60)" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
@@ -814,7 +987,7 @@ public class ChatService : IChatService
             {
                 ["credit_card_id"] = new { type = "string", description = "ID ou nome do cartão (ex: GUID ou 'Nubank')" },
                 ["description"] = new { type = "string", description = "Descrição da compra" },
-                ["amount"] = new { type = "number", description = "Valor total em reais" },
+                ["amount"] = new { type = "number", description = "Valor total em reais (número, ex: 2500)" },
                 ["purchase_date"] = new { type = "string", description = "Data da compra yyyy-MM-dd" },
                 ["installments"] = new { type = "integer", description = "Número de parcelas (1 = à vista)" },
                 ["notes"] = new { type = "string", description = "Observações opcionais" },
@@ -847,6 +1020,18 @@ public class ChatService : IChatService
         Tool("list_all_card_purchases",
             "Lista TODAS as compras pendentes de TODOS os cartões do usuário. Use quando precisar de uma visão geral das compras no cartão.",
             new Dictionary<string, object>(), []),
+
+        Tool("generate_purchase_plan",
+            "Gera um plano de compra estruturado com projeção mensal, cenários (PIX, cartão à vista, parcelado) e recomendação. Use SEMPRE que o usuário quiser comprar algo e pedir para planejar/simular/comparar formas de pagamento. O resultado é exibido visualmente no frontend.",
+            new Dictionary<string, object>
+            {
+                ["product_name"] = new { type = "string", description = "Nome do produto (ex: '2x Monitores')" },
+                ["total_price"] = new { type = "number", description = "Preço total em reais (número, ex: 5000)" },
+                ["pix_discount_percent"] = new { type = "number", description = "Percentual de desconto no PIX (número, padrão 10)" },
+                ["savings_goal"] = new { type = "number", description = "Meta de economia mensal do usuário (número, 0 se não informado)" },
+                ["start_month"] = new { type = "string", description = "Mês de início yyyy-MM (padrão: próximo mês)" },
+            },
+            ["product_name", "total_price"]),
     ];
 
     private static object Tool(string name, string description,
@@ -935,6 +1120,337 @@ public class ChatService : IChatService
 
     private record ListCardPurchasesArgs(
         [property: JsonPropertyName("credit_card_id")] string CreditCardId);
+
+    private record GeneratePurchasePlanArgs(
+        [property: JsonPropertyName("product_name")] string ProductName,
+        [property: JsonPropertyName("total_price")] decimal TotalPrice,
+        [property: JsonPropertyName("pix_discount_percent")] decimal? PixDiscountPercent,
+        [property: JsonPropertyName("savings_goal")] decimal? SavingsGoal,
+        [property: JsonPropertyName("start_month")] string? StartMonth);
+
+    // ─── Purchase Plan Builder ───
+
+    private async Task<PurchasePlanResult> BuildPurchasePlan(Guid userId, GeneratePurchasePlanArgs args)
+    {
+        var startMonth = !string.IsNullOrEmpty(args.StartMonth)
+            ? DateOnly.ParseExact(args.StartMonth + "-01", "yyyy-MM-dd")
+            : DateOnly.FromDateTime(DateTime.UtcNow).AddMonths(1);
+
+        var pixDiscount = args.PixDiscountPercent ?? 10m;
+        var pixPrice = args.TotalPrice * (1 - pixDiscount / 100m);
+        var savingsGoal = args.SavingsGoal ?? 0m;
+
+        // Gather all data
+        var debts = (await _debtService.GetPendingByUserIdAsync(userId)).ToList();
+        var receivables = (await _receivableService.GetPendingByUserIdAsync(userId)).ToList();
+        var cards = (await _creditCardService.GetByUserIdAsync(userId)).ToList();
+
+        // Build card billing by month
+        var cardMonthly = new SortedDictionary<string, decimal>();
+        foreach (var card in cards)
+        {
+            var purchases = (await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id)).ToList();
+            foreach (var p in purchases)
+            {
+                var firstBilling = p.PurchaseDate.Day <= card.ClosingDay
+                    ? new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1)
+                    : new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1).AddMonths(1);
+                for (int inst = p.CurrentInstallment; inst <= p.Installments; inst++)
+                {
+                    var key = firstBilling.AddMonths(inst - 1).ToString("yyyy-MM");
+                    cardMonthly.TryAdd(key, 0);
+                    cardMonthly[key] += p.Amount;
+                }
+            }
+        }
+
+        // Build monthly projection (12 months)
+        var projection = new List<MonthProjection>();
+        string[] monthNames = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
+        for (int i = 0; i < 12; i++)
+        {
+            var month = startMonth.AddMonths(i);
+            var key = month.ToString("yyyy-MM");
+            var label = $"{monthNames[month.Month]}/{month.Year}";
+
+            var monthReceivables = receivables
+                .Where(r => r.ExpectedDate.ToString("yyyy-MM") == key)
+                .Sum(r => r.Amount);
+
+            var monthDebts = debts
+                .Where(d => d.DueDate.ToString("yyyy-MM") == key)
+                .Sum(d => d.Amount);
+
+            cardMonthly.TryGetValue(key, out var monthCards);
+
+            var totalExpenses = monthDebts + monthCards;
+            var freeBalance = monthReceivables - totalExpenses;
+            var afterSavings = freeBalance - savingsGoal;
+
+            projection.Add(new MonthProjection(key, label, monthReceivables, monthDebts,
+                monthCards, totalExpenses, freeBalance, afterSavings));
+        }
+
+        // ─── Card Strategy: analyze best cards for this purchase ───
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var activeCards = cards.Where(c => c.IsActive).ToList();
+        var cardAnalysis = new List<CardPlanAnalysis>();
+
+        foreach (var card in activeCards)
+        {
+            var available = card.AvailableLimit ?? 0m;
+            if (card.CreditLimit == null) continue; // skip no-limit cards for strategy
+
+            // Calculate payment timeline (same logic as GetBestCardForTodayAsync)
+            DateOnly nextClosing;
+            if (today.Day <= card.ClosingDay)
+                nextClosing = new DateOnly(today.Year, today.Month, Math.Min(card.ClosingDay, DateTime.DaysInMonth(today.Year, today.Month)));
+            else
+            {
+                var nextMonth = today.AddMonths(1);
+                nextClosing = new DateOnly(nextMonth.Year, nextMonth.Month, Math.Min(card.ClosingDay, DateTime.DaysInMonth(nextMonth.Year, nextMonth.Month)));
+            }
+
+            DateOnly dueDate;
+            if (card.DueDay > card.ClosingDay)
+                dueDate = new DateOnly(nextClosing.Year, nextClosing.Month, Math.Min(card.DueDay, DateTime.DaysInMonth(nextClosing.Year, nextClosing.Month)));
+            else
+            {
+                var dueMonth = nextClosing.AddMonths(1);
+                dueDate = new DateOnly(dueMonth.Year, dueMonth.Month, Math.Min(card.DueDay, DateTime.DaysInMonth(dueMonth.Year, dueMonth.Month)));
+            }
+
+            var daysUntilPayment = dueDate.DayNumber - today.DayNumber;
+            var afterClosing = today.Day > card.ClosingDay;
+
+            cardAnalysis.Add(new CardPlanAnalysis(
+                card.Id, card.Name, card.LastFourDigits,
+                card.CreditLimit.Value, available,
+                card.ClosingDay, card.DueDay,
+                daysUntilPayment, afterClosing,
+                nextClosing, dueDate));
+        }
+
+        // Sort: longest payment window first
+        cardAnalysis = cardAnalysis.OrderByDescending(c => c.DaysUntilPayment).ToList();
+
+        // Build card strategy
+        var cardStrategies = new List<CardPlanStrategy>();
+
+        // Strategy 1: Single card (if any card has enough limit)
+        foreach (var card in cardAnalysis.Where(c => c.AvailableLimit >= args.TotalPrice))
+        {
+            var explanation = card.AfterClosing
+                ? $"Fatura já fechou (dia {card.ClosingDay}). Compra entra na próxima fatura, vence {card.DueDate:dd/MM/yyyy} — {card.DaysUntilPayment} dias para pagar."
+                : $"Fatura ainda aberta (fecha dia {card.ClosingDay}). Vence {card.DueDate:dd/MM/yyyy} — {card.DaysUntilPayment} dias para pagar.";
+
+            cardStrategies.Add(new CardPlanStrategy(
+                "single",
+                $"Tudo no {card.CardName}",
+                [new CardAllocation(card.CardId, card.CardName, card.LastFourDigits, args.TotalPrice, card.AvailableLimit, card.DaysUntilPayment, card.DueDate, explanation)],
+                card.DaysUntilPayment,
+                true));
+        }
+
+        // Strategy 2: Split across multiple cards (if no single card covers it)
+        if (!cardAnalysis.Any(c => c.AvailableLimit >= args.TotalPrice) && cardAnalysis.Count >= 2)
+        {
+            var remaining = args.TotalPrice;
+            var allocations = new List<CardAllocation>();
+            var minDays = int.MaxValue;
+
+            foreach (var card in cardAnalysis)
+            {
+                if (remaining <= 0) break;
+                if (card.AvailableLimit <= 0) continue;
+
+                var useAmount = Math.Min(remaining, card.AvailableLimit);
+                remaining -= useAmount;
+                minDays = Math.Min(minDays, card.DaysUntilPayment);
+
+                var explanation = card.AfterClosing
+                    ? $"Pós-fechamento (dia {card.ClosingDay}). Vence {card.DueDate:dd/MM/yyyy} — {card.DaysUntilPayment}d."
+                    : $"Pré-fechamento (dia {card.ClosingDay}). Vence {card.DueDate:dd/MM/yyyy} — {card.DaysUntilPayment}d.";
+
+                allocations.Add(new CardAllocation(
+                    card.CardId, card.CardName, card.LastFourDigits,
+                    useAmount, card.AvailableLimit, card.DaysUntilPayment, card.DueDate, explanation));
+            }
+
+            var covered = remaining <= 0;
+            var stratLabel = covered
+                ? $"Dividir entre {allocations.Count} cartões"
+                : $"Dividir entre {allocations.Count} cartões (faltam {remaining:F2})";
+
+            cardStrategies.Add(new CardPlanStrategy(
+                "split", stratLabel, allocations,
+                minDays == int.MaxValue ? 0 : minDays, covered));
+        }
+
+        // Total available across all cards
+        var totalAvailable = cardAnalysis.Sum(c => c.AvailableLimit);
+        var bestCardForToday = cardAnalysis.FirstOrDefault();
+
+        var cardStrategyResult = new CardStrategyResult(
+            totalAvailable,
+            totalAvailable >= args.TotalPrice,
+            bestCardForToday?.CardName,
+            bestCardForToday?.DaysUntilPayment ?? 0,
+            cardAnalysis.Select(c => new CardSummary(
+                c.CardId, c.CardName, c.LastFourDigits,
+                c.CreditLimit, c.AvailableLimit,
+                c.ClosingDay, c.DueDay,
+                c.DaysUntilPayment, c.AfterClosing)).ToList(),
+            cardStrategies);
+
+        // Build scenarios
+        var scenarios = new List<PurchaseScenario>();
+        int[] installmentOptions = [1, 2, 3, 6, 10, 12];
+
+        // PIX scenario
+        var pixImpact = BuildScenarioImpact(projection, pixPrice, 1, savingsGoal);
+        scenarios.Add(new PurchaseScenario("pix", $"PIX à vista ({pixDiscount:F0}% desc.)",
+            pixPrice, 1, pixPrice, pixImpact.Viable, pixImpact.Months));
+
+        // Card scenarios
+        foreach (var n in installmentOptions)
+        {
+            var installmentValue = Math.Round(args.TotalPrice / n, 2);
+            var impact = BuildScenarioImpact(projection, installmentValue, n, savingsGoal);
+            var label = n == 1 ? "Cartão à vista" : $"Cartão {n}x sem juros";
+            scenarios.Add(new PurchaseScenario("card", label,
+                args.TotalPrice, n, installmentValue, impact.Viable, impact.Months));
+        }
+
+        // Find best scenario
+        var bestScenario = scenarios
+            .Where(s => s.Viable)
+            .OrderByDescending(s => s.Type == "pix" ? 1 : 0)
+            .ThenBy(s => s.TotalCost)
+            .ThenByDescending(s => s.MonthlyImpact.Min(m => m.RemainingAfterSavings))
+            .FirstOrDefault();
+
+        // Build recommendation including card info
+        var recommendation = bestScenario != null
+            ? $"{bestScenario.Label} é a melhor opção. " +
+              (bestScenario.Type == "pix"
+                  ? $"Você economiza R${args.TotalPrice - pixPrice:F2} com o desconto. "
+                  : "") +
+              $"Parcela de R${bestScenario.InstallmentValue:F2}, mantendo a meta de R${savingsGoal:F2}/mês."
+            : "Nenhum cenário é viável sem comprometer a meta. Considere adiar ou reduzir o valor.";
+
+        if (bestScenario?.Type == "card" && bestCardForToday != null)
+        {
+            var cardTip = bestCardForToday.AfterClosing
+                ? $" Use o {bestCardForToday.CardName} (•••• {bestCardForToday.LastFourDigits}) — fatura já fechou, próximo pagamento só em {bestCardForToday.DaysUntilPayment} dias."
+                : $" Use o {bestCardForToday.CardName} (•••• {bestCardForToday.LastFourDigits}) — {bestCardForToday.DaysUntilPayment} dias até o vencimento.";
+            recommendation += cardTip;
+        }
+
+        return new PurchasePlanResult(args.ProductName, args.TotalPrice, pixDiscount,
+            pixPrice, savingsGoal, startMonth.ToString("yyyy-MM"),
+            projection, scenarios, recommendation, cardStrategyResult);
+    }
+
+    private static (bool Viable, List<ScenarioMonthImpact> Months) BuildScenarioImpact(
+        List<MonthProjection> projection, decimal installmentValue, int installments, decimal savingsGoal)
+    {
+        var months = new List<ScenarioMonthImpact>();
+        bool viable = true;
+
+        for (int i = 0; i < Math.Min(installments, projection.Count); i++)
+        {
+            var mp = projection[i];
+            var remaining = mp.AfterSavings - installmentValue;
+            if (remaining < 0) viable = false;
+            months.Add(new ScenarioMonthImpact(mp.Month, mp.Label, installmentValue, remaining));
+        }
+
+        return (viable, months);
+    }
+
+    // Plan result records
+    private record PurchasePlanResult(
+        [property: JsonPropertyName("product")] string Product,
+        [property: JsonPropertyName("totalPrice")] decimal TotalPrice,
+        [property: JsonPropertyName("pixDiscountPercent")] decimal PixDiscountPercent,
+        [property: JsonPropertyName("pixPrice")] decimal PixPrice,
+        [property: JsonPropertyName("savingsGoal")] decimal SavingsGoal,
+        [property: JsonPropertyName("startMonth")] string StartMonth,
+        [property: JsonPropertyName("monthlyProjection")] List<MonthProjection> MonthlyProjection,
+        [property: JsonPropertyName("scenarios")] List<PurchaseScenario> Scenarios,
+        [property: JsonPropertyName("recommendation")] string Recommendation,
+        [property: JsonPropertyName("cardStrategy")] CardStrategyResult? CardStrategy);
+
+    private record MonthProjection(
+        [property: JsonPropertyName("month")] string Month,
+        [property: JsonPropertyName("label")] string Label,
+        [property: JsonPropertyName("receivables")] decimal Receivables,
+        [property: JsonPropertyName("debts")] decimal Debts,
+        [property: JsonPropertyName("cards")] decimal Cards,
+        [property: JsonPropertyName("totalExpenses")] decimal TotalExpenses,
+        [property: JsonPropertyName("freeBalance")] decimal FreeBalance,
+        [property: JsonPropertyName("afterSavings")] decimal AfterSavings);
+
+    private record PurchaseScenario(
+        [property: JsonPropertyName("type")] string Type,
+        [property: JsonPropertyName("label")] string Label,
+        [property: JsonPropertyName("totalCost")] decimal TotalCost,
+        [property: JsonPropertyName("installments")] int Installments,
+        [property: JsonPropertyName("installmentValue")] decimal InstallmentValue,
+        [property: JsonPropertyName("viable")] bool Viable,
+        [property: JsonPropertyName("monthlyImpact")] List<ScenarioMonthImpact> MonthlyImpact);
+
+    private record ScenarioMonthImpact(
+        [property: JsonPropertyName("month")] string Month,
+        [property: JsonPropertyName("label")] string Label,
+        [property: JsonPropertyName("payment")] decimal Payment,
+        [property: JsonPropertyName("remainingAfterSavings")] decimal RemainingAfterSavings);
+
+    // Card strategy records
+    private record CardPlanAnalysis(
+        Guid CardId, string CardName, string LastFourDigits,
+        decimal CreditLimit, decimal AvailableLimit,
+        int ClosingDay, int DueDay,
+        int DaysUntilPayment, bool AfterClosing,
+        DateOnly NextClosing, DateOnly DueDate);
+
+    private record CardStrategyResult(
+        [property: JsonPropertyName("totalAvailable")] decimal TotalAvailable,
+        [property: JsonPropertyName("coversFullAmount")] bool CoversFullAmount,
+        [property: JsonPropertyName("bestCardName")] string? BestCardName,
+        [property: JsonPropertyName("bestCardDaysUntilPayment")] int BestCardDaysUntilPayment,
+        [property: JsonPropertyName("cards")] List<CardSummary> Cards,
+        [property: JsonPropertyName("strategies")] List<CardPlanStrategy> Strategies);
+
+    private record CardSummary(
+        [property: JsonPropertyName("cardId")] Guid CardId,
+        [property: JsonPropertyName("cardName")] string CardName,
+        [property: JsonPropertyName("lastFourDigits")] string LastFourDigits,
+        [property: JsonPropertyName("creditLimit")] decimal CreditLimit,
+        [property: JsonPropertyName("availableLimit")] decimal AvailableLimit,
+        [property: JsonPropertyName("closingDay")] int ClosingDay,
+        [property: JsonPropertyName("dueDay")] int DueDay,
+        [property: JsonPropertyName("daysUntilPayment")] int DaysUntilPayment,
+        [property: JsonPropertyName("afterClosing")] bool AfterClosing);
+
+    private record CardPlanStrategy(
+        [property: JsonPropertyName("type")] string Type,
+        [property: JsonPropertyName("label")] string Label,
+        [property: JsonPropertyName("allocations")] List<CardAllocation> Allocations,
+        [property: JsonPropertyName("maxDaysUntilPayment")] int MaxDaysUntilPayment,
+        [property: JsonPropertyName("coversFullAmount")] bool CoversFullAmount);
+
+    private record CardAllocation(
+        [property: JsonPropertyName("cardId")] Guid CardId,
+        [property: JsonPropertyName("cardName")] string CardName,
+        [property: JsonPropertyName("lastFourDigits")] string LastFourDigits,
+        [property: JsonPropertyName("amount")] decimal Amount,
+        [property: JsonPropertyName("availableLimit")] decimal AvailableLimit,
+        [property: JsonPropertyName("daysUntilPayment")] int DaysUntilPayment,
+        [property: JsonPropertyName("dueDate")] DateOnly DueDate,
+        [property: JsonPropertyName("explanation")] string Explanation);
 }
 
 // Groq API response models
