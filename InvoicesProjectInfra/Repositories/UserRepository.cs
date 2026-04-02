@@ -20,4 +20,9 @@ public class UserRepository : Repository<User>, IUserRepository
     {
         return await _dbSet.AnyAsync(u => u.Email == email);
     }
+
+    public async Task<User?> GetByPhoneNumberAsync(string phoneNumber)
+    {
+        return await _dbSet.FirstOrDefaultAsync(u => u.WhatsAppPhoneNumber == phoneNumber && u.IsActive);
+    }
 }

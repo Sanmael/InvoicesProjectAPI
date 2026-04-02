@@ -12,6 +12,16 @@ public class User : BaseEntity
     /// </summary>
     public bool IsAdmin { get; set; } = false;
 
+    /// <summary>
+    /// Número do WhatsApp vinculado (formato internacional, ex: "5511999998888")
+    /// </summary>
+    public string? WhatsAppPhoneNumber { get; set; }
+
+    /// <summary>
+    /// Se o WhatsApp está vinculado e ativo para uso do sistema
+    /// </summary>
+    public bool WhatsAppLinked { get; set; } = false;
+
     // Navigation properties
     public virtual ICollection<Debt> Debts { get; set; } = new List<Debt>();
     public virtual ICollection<Receivable> Receivables { get; set; } = new List<Receivable>();

@@ -57,6 +57,8 @@ public static class DependencyInjection
         services.AddScoped<IDocumentImportService, DocumentImportService>();
         services.AddScoped<IBankImportService, BankImportService>();
         services.AddScoped<ITelegramService, TelegramService>();
+        services.AddScoped<IWhatsAppProvider, BaileysWhatsAppProvider>();
+        services.AddScoped<IWhatsAppService, WhatsAppService>();
         services.AddHttpClient("ChatProvider");
         services.AddHostedService<NotificationProcessingHostedService>();
 

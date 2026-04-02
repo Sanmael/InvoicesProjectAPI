@@ -32,6 +32,8 @@ public class AppDbContext : DbContext
             entity.HasIndex(e => e.Email).IsUnique();
             entity.Property(e => e.PasswordHash).IsRequired();
             entity.Property(e => e.IsAdmin).HasDefaultValue(false);
+            entity.Property(e => e.WhatsAppPhoneNumber).HasMaxLength(20);
+            entity.HasIndex(e => e.WhatsAppPhoneNumber).IsUnique().HasFilter("\"WhatsAppPhoneNumber\" IS NOT NULL");
         });
 
         // Debt

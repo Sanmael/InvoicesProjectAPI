@@ -1147,19 +1147,30 @@ public class ChatService : IChatService
 
         // Build card billing by month
         var cardMonthly = new SortedDictionary<string, decimal>();
+        var cardMonthlyByCard = new Dictionary<Guid, SortedDictionary<string, decimal>>();
         foreach (var card in cards)
         {
+            if (!cardMonthlyByCard.TryGetValue(card.Id, out var perCardMonthly))
+            {
+                perCardMonthly = new SortedDictionary<string, decimal>();
+                cardMonthlyByCard[card.Id] = perCardMonthly;
+            }
+
             var purchases = (await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id)).ToList();
             foreach (var p in purchases)
             {
-                var firstBilling = p.PurchaseDate.Day <= card.ClosingDay
+                var installmentAmount = p.Installments > 0 ? p.Amount / p.Installments : p.Amount;
+                var firstBilling = p.Installments <= 1 || p.PurchaseDate.Day <= card.ClosingDay
                     ? new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1)
                     : new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1).AddMonths(1);
                 for (int inst = p.CurrentInstallment; inst <= p.Installments; inst++)
                 {
                     var key = firstBilling.AddMonths(inst - 1).ToString("yyyy-MM");
                     cardMonthly.TryAdd(key, 0);
-                    cardMonthly[key] += p.Amount;
+                    cardMonthly[key] += installmentAmount;
+
+                    perCardMonthly.TryAdd(key, 0);
+                    perCardMonthly[key] += installmentAmount;
                 }
             }
         }
@@ -1199,8 +1210,19 @@ public class ChatService : IChatService
 
         foreach (var card in activeCards)
         {
-            var available = card.AvailableLimit ?? 0m;
+            var currentAvailable = card.AvailableLimit ?? 0m;
             if (card.CreditLimit == null) continue; // skip no-limit cards for strategy
+
+            var startKey = startMonth.ToString("yyyy-MM");
+            var restoredUntilStart = 0m;
+            if (cardMonthlyByCard.TryGetValue(card.Id, out var perCardMonthly))
+            {
+                restoredUntilStart = perCardMonthly
+                    .Where(kvp => string.CompareOrdinal(kvp.Key, startKey) < 0)
+                    .Sum(kvp => kvp.Value);
+            }
+
+            var projectedAvailableAtStart = Math.Min(card.CreditLimit.Value, currentAvailable + restoredUntilStart);
 
             // Calculate payment timeline (same logic as GetBestCardForTodayAsync)
             DateOnly nextClosing;
@@ -1226,7 +1248,8 @@ public class ChatService : IChatService
 
             cardAnalysis.Add(new CardPlanAnalysis(
                 card.Id, card.Name, card.LastFourDigits,
-                card.CreditLimit.Value, available,
+                card.CreditLimit.Value, projectedAvailableAtStart,
+                currentAvailable, restoredUntilStart,
                 card.ClosingDay, card.DueDay,
                 daysUntilPayment, afterClosing,
                 nextClosing, dueDate));
@@ -1292,6 +1315,22 @@ public class ChatService : IChatService
         var totalAvailable = cardAnalysis.Sum(c => c.AvailableLimit);
         var bestCardForToday = cardAnalysis.FirstOrDefault();
 
+        // Build per-card bill projections (existing committed installments per month)
+        var billsByCard = new List<CardBillProjection>();
+        foreach (var card in cardAnalysis)
+        {
+            var months = new List<CardBillMonth>();
+            foreach (var proj in projection)
+            {
+                decimal amount = 0;
+                if (cardMonthlyByCard.TryGetValue(card.CardId, out var perCardMonthly))
+                    perCardMonthly.TryGetValue(proj.Month, out amount);
+                months.Add(new CardBillMonth(proj.Month, proj.Label, amount));
+            }
+            if (months.Any(m => m.Amount > 0))
+                billsByCard.Add(new CardBillProjection(card.CardId, card.CardName, card.LastFourDigits, months));
+        }
+
         var cardStrategyResult = new CardStrategyResult(
             totalAvailable,
             totalAvailable >= args.TotalPrice,
@@ -1300,9 +1339,11 @@ public class ChatService : IChatService
             cardAnalysis.Select(c => new CardSummary(
                 c.CardId, c.CardName, c.LastFourDigits,
                 c.CreditLimit, c.AvailableLimit,
+                c.CurrentAvailableLimit, c.RestoredByStartMonth,
                 c.ClosingDay, c.DueDay,
                 c.DaysUntilPayment, c.AfterClosing)).ToList(),
-            cardStrategies);
+            cardStrategies,
+            billsByCard);
 
         // Build scenarios
         var scenarios = new List<PurchaseScenario>();
@@ -1340,6 +1381,13 @@ public class ChatService : IChatService
               $"Parcela de R${bestScenario.InstallmentValue:F2}, mantendo a meta de R${savingsGoal:F2}/mês."
             : "Nenhum cenário é viável sem comprometer a meta. Considere adiar ou reduzir o valor.";
 
+        if (bestScenario == null && !cardStrategyResult.CoversFullAmount)
+        {
+            var missing = Math.Max(0m, args.TotalPrice - cardStrategyResult.TotalAvailable);
+            recommendation += $" Seus cartões atuais cobrem R${cardStrategyResult.TotalAvailable:F2}; faltam R${missing:F2}. " +
+                "Se usar cartão externo/complementar, a projeção já considera o impacto da nova parcela somado às suas faturas atuais.";
+        }
+
         if (bestScenario?.Type == "card" && bestCardForToday != null)
         {
             var cardTip = bestCardForToday.AfterClosing
@@ -1362,9 +1410,17 @@ public class ChatService : IChatService
         for (int i = 0; i < Math.Min(installments, projection.Count); i++)
         {
             var mp = projection[i];
+            var totalCardBill = mp.Cards + installmentValue;
             var remaining = mp.AfterSavings - installmentValue;
             if (remaining < 0) viable = false;
-            months.Add(new ScenarioMonthImpact(mp.Month, mp.Label, installmentValue, remaining));
+            months.Add(new ScenarioMonthImpact(
+                mp.Month,
+                mp.Label,
+                installmentValue,
+                mp.Cards,
+                totalCardBill,
+                mp.Debts + totalCardBill,
+                remaining));
         }
 
         return (viable, months);
@@ -1406,12 +1462,16 @@ public class ChatService : IChatService
         [property: JsonPropertyName("month")] string Month,
         [property: JsonPropertyName("label")] string Label,
         [property: JsonPropertyName("payment")] decimal Payment,
+        [property: JsonPropertyName("baseCardBill")] decimal BaseCardBill,
+        [property: JsonPropertyName("totalCardBill")] decimal TotalCardBill,
+        [property: JsonPropertyName("totalOutflow")] decimal TotalOutflow,
         [property: JsonPropertyName("remainingAfterSavings")] decimal RemainingAfterSavings);
 
     // Card strategy records
     private record CardPlanAnalysis(
         Guid CardId, string CardName, string LastFourDigits,
         decimal CreditLimit, decimal AvailableLimit,
+        decimal CurrentAvailableLimit, decimal RestoredByStartMonth,
         int ClosingDay, int DueDay,
         int DaysUntilPayment, bool AfterClosing,
         DateOnly NextClosing, DateOnly DueDate);
@@ -1422,7 +1482,8 @@ public class ChatService : IChatService
         [property: JsonPropertyName("bestCardName")] string? BestCardName,
         [property: JsonPropertyName("bestCardDaysUntilPayment")] int BestCardDaysUntilPayment,
         [property: JsonPropertyName("cards")] List<CardSummary> Cards,
-        [property: JsonPropertyName("strategies")] List<CardPlanStrategy> Strategies);
+        [property: JsonPropertyName("strategies")] List<CardPlanStrategy> Strategies,
+        [property: JsonPropertyName("billsByCard")] List<CardBillProjection> BillsByCard);
 
     private record CardSummary(
         [property: JsonPropertyName("cardId")] Guid CardId,
@@ -1430,6 +1491,8 @@ public class ChatService : IChatService
         [property: JsonPropertyName("lastFourDigits")] string LastFourDigits,
         [property: JsonPropertyName("creditLimit")] decimal CreditLimit,
         [property: JsonPropertyName("availableLimit")] decimal AvailableLimit,
+        [property: JsonPropertyName("currentAvailableLimit")] decimal CurrentAvailableLimit,
+        [property: JsonPropertyName("restoredByStartMonth")] decimal RestoredByStartMonth,
         [property: JsonPropertyName("closingDay")] int ClosingDay,
         [property: JsonPropertyName("dueDay")] int DueDay,
         [property: JsonPropertyName("daysUntilPayment")] int DaysUntilPayment,
@@ -1451,6 +1514,17 @@ public class ChatService : IChatService
         [property: JsonPropertyName("daysUntilPayment")] int DaysUntilPayment,
         [property: JsonPropertyName("dueDate")] DateOnly DueDate,
         [property: JsonPropertyName("explanation")] string Explanation);
+
+    private record CardBillMonth(
+        [property: JsonPropertyName("month")] string Month,
+        [property: JsonPropertyName("label")] string Label,
+        [property: JsonPropertyName("amount")] decimal Amount);
+
+    private record CardBillProjection(
+        [property: JsonPropertyName("cardId")] Guid CardId,
+        [property: JsonPropertyName("cardName")] string CardName,
+        [property: JsonPropertyName("lastFourDigits")] string LastFourDigits,
+        [property: JsonPropertyName("months")] List<CardBillMonth> Months);
 }
 
 // Groq API response models
