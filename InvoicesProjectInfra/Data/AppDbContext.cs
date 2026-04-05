@@ -138,6 +138,7 @@ public class AppDbContext : DbContext
             entity.HasKey(e => e.Id);
             entity.Property(e => e.Title).HasMaxLength(200).IsRequired();
             entity.Property(e => e.Description).HasMaxLength(1000);
+            entity.Property(e => e.ProductUrl).HasMaxLength(1000);
             entity.Property(e => e.TargetAmount).HasPrecision(18, 2);
             entity.Property(e => e.CurrentAmount).HasPrecision(18, 2);
             entity.Property(e => e.Category).HasMaxLength(50).HasDefaultValue("Outros");

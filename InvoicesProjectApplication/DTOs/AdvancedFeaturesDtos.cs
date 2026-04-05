@@ -6,6 +6,8 @@ public record SavingsGoalDto(
     Guid Id,
     string Title,
     string? Description,
+    string? ProductImageDataUrl,
+    string? ProductUrl,
     decimal TargetAmount,
     decimal CurrentAmount,
     DateOnly? Deadline,
@@ -18,6 +20,8 @@ public record SavingsGoalDto(
 public record CreateSavingsGoalDto(
     string Title,
     string? Description,
+    string? ProductImageDataUrl,
+    string? ProductUrl,
     decimal TargetAmount,
     decimal CurrentAmount,
     DateOnly? Deadline,
@@ -26,6 +30,8 @@ public record CreateSavingsGoalDto(
 public record UpdateSavingsGoalDto(
     string? Title,
     string? Description,
+    string? ProductImageDataUrl,
+    string? ProductUrl,
     decimal? TargetAmount,
     decimal? CurrentAmount,
     DateOnly? Deadline,

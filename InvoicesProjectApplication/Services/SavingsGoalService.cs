@@ -40,6 +40,8 @@ public class SavingsGoalService : ISavingsGoalService
             UserId = userId,
             Title = dto.Title,
             Description = dto.Description,
+            ProductImageDataUrl = dto.ProductImageDataUrl,
+            ProductUrl = dto.ProductUrl,
             TargetAmount = dto.TargetAmount,
             CurrentAmount = dto.CurrentAmount,
             Deadline = dto.Deadline,
@@ -60,6 +62,12 @@ public class SavingsGoalService : ISavingsGoalService
 
         if (dto.Description is not null)
             goal.Description = dto.Description;
+
+        if (dto.ProductImageDataUrl is not null)
+            goal.ProductImageDataUrl = dto.ProductImageDataUrl;
+
+        if (dto.ProductUrl is not null)
+            goal.ProductUrl = dto.ProductUrl;
 
         if (dto.TargetAmount.HasValue)
             goal.TargetAmount = dto.TargetAmount.Value;
@@ -120,6 +128,8 @@ public class SavingsGoalService : ISavingsGoalService
             goal.Id,
             goal.Title,
             goal.Description,
+            goal.ProductImageDataUrl,
+            goal.ProductUrl,
             goal.TargetAmount,
             goal.CurrentAmount,
             goal.Deadline,
