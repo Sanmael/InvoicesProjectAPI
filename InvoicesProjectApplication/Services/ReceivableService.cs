@@ -40,7 +40,8 @@ public class ReceivableService : IReceivableService
             Description = dto.Description,
             Amount = dto.Amount,
             ExpectedDate = dto.ExpectedDate,
-            Notes = dto.Notes
+            Notes = dto.Notes,
+            TagEventoId = dto.TagEventoId
         };
 
         await _receivableRepository.AddAsync(receivable);
@@ -74,6 +75,7 @@ public class ReceivableService : IReceivableService
                 Amount = dto.Amount,
                 ExpectedDate = targetDate,
                 Notes = dto.Notes,
+                TagEventoId = dto.TagEventoId,
                 IsRecurring = true,
                 RecurringDay = dto.RecurringDay,
                 RecurrenceGroupId = groupId
@@ -109,6 +111,9 @@ public class ReceivableService : IReceivableService
         if (dto.Notes is not null)
             receivable.Notes = dto.Notes;
 
+        if (dto.TagEventoId.HasValue)
+            receivable.TagEventoId = dto.TagEventoId;
+
         receivable.UpdatedAt = DateTime.UtcNow;
         await _receivableRepository.UpdateAsync(receivable);
         return MapToDto(receivable);
@@ -142,6 +147,6 @@ public class ReceivableService : IReceivableService
     private static ReceivableDto MapToDto(Receivable receivable) =>
         new(receivable.Id, receivable.Description, receivable.Amount, receivable.ExpectedDate,
             receivable.IsReceived, receivable.ReceivedAt, receivable.Notes,
-            receivable.IsRecurring, receivable.RecurringDay, receivable.RecurrenceGroupId,
+            receivable.IsRecurring, receivable.RecurringDay, receivable.RecurrenceGroupId, receivable.TagEventoId,
             receivable.CreatedAt);
 }

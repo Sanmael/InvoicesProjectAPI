@@ -11,6 +11,7 @@ public class AppDbContext : DbContext
 
     public DbSet<User> Users => Set<User>();
     public DbSet<Debt> Debts => Set<Debt>();
+    public DbSet<TagEvento> TagEventos => Set<TagEvento>();
     public DbSet<Receivable> Receivables => Set<Receivable>();
     public DbSet<CreditCard> CreditCards => Set<CreditCard>();
     public DbSet<CardPurchase> CardPurchases => Set<CardPurchase>();
@@ -145,6 +146,34 @@ public class AppDbContext : DbContext
                 .WithMany(u => u.SavingsGoals)
                 .HasForeignKey(e => e.UserId)
                 .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // TagEvento
+        modelBuilder.Entity<TagEvento>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Nome).HasMaxLength(200).IsRequired();
+            entity.Property(e => e.Descricao).HasMaxLength(1000);
+
+            entity.HasOne(e => e.User)
+                .WithMany()
+                .HasForeignKey(e => e.UserId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasMany(e => e.Debts)
+                .WithOne(d => d.TagEvento)
+                .HasForeignKey(d => d.TagEventoId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasMany(e => e.Receivables)
+                .WithOne(r => r.TagEvento)
+                .HasForeignKey(r => r.TagEventoId)
+                .OnDelete(DeleteBehavior.SetNull);
+
+            entity.HasMany(e => e.CardPurchases)
+                .WithOne(c => c.TagEvento)
+                .HasForeignKey(c => c.TagEventoId)
+                .OnDelete(DeleteBehavior.SetNull);
         });
     }
 }

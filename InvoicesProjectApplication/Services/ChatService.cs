@@ -197,6 +197,7 @@ public class ChatService : IChatService
     {
         var actions = new List<ChatActionResult>();
         var toolMessages = new List<object>();
+        var fallbackDetails = new List<string>();
         string? planPayload = null;
 
         foreach (var toolCall in toolCalls)
@@ -223,6 +224,9 @@ public class ChatService : IChatService
             // Intercept purchase plan - don't send raw JSON to LLM
             planPayload ??= ExtractPlanPayload(toolResult);
             var contentForLlm = StripPlanMarkers(toolResult);
+
+            if (!string.IsNullOrWhiteSpace(contentForLlm))
+                fallbackDetails.Add(contentForLlm.Trim());
 
             toolMessages.Add(new { role = "tool", tool_call_id = toolCall.Id, content = contentForLlm });
         }
@@ -271,7 +275,9 @@ public class ChatService : IChatService
         var summary = string.Join("\n", actions.Select(a =>
             a.Success ? $"✅ {a.Description}" : $"❌ {a.Description}"));
 
-        var fallback = string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
+        var fallback = fallbackDetails.Count > 0
+            ? string.Join("\n\n", fallbackDetails)
+            : string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
         if (planPayload is not null)
             fallback += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
 
@@ -329,6 +335,7 @@ public class ChatService : IChatService
         ProviderConfig provider)
     {
         var actions = new List<ChatActionResult>();
+        var fallbackDetails = new List<string>();
 
         var modelParts = functionCallParts.Select(p => (object)new
         {
@@ -381,6 +388,9 @@ public class ChatService : IChatService
             planPayload ??= ExtractPlanPayload(resultStr);
             var cleanResult = StripPlanMarkers(resultStr);
 
+            if (!string.IsNullOrWhiteSpace(cleanResult))
+                fallbackDetails.Add(cleanResult.Trim());
+
             var frName = rpDoc.RootElement.GetProperty("function_response").GetProperty("name").GetString();
             cleanedResponseParts.Add(new
             {
@@ -424,7 +434,9 @@ public class ChatService : IChatService
 
         var summary = string.Join("\n", actions.Select(a =>
             a.Success ? $"✅ {a.Description}" : $"❌ {a.Description}"));
-        var fallback = string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
+        var fallback = fallbackDetails.Count > 0
+            ? string.Join("\n\n", fallbackDetails)
+            : string.IsNullOrWhiteSpace(summary) ? "Ações processadas." : summary;
         if (planPayload is not null)
             fallback += $"\n\n<!--PURCHASE_PLAN-->{planPayload}<!--/PURCHASE_PLAN-->";
         return new ChatResponseDto(fallback, actions);

@@ -42,7 +42,8 @@ public class DebtService : IDebtService
             Amount = dto.Amount,
             DueDate = dto.DueDate,
             Notes = dto.Notes,
-            Category = ExpenseCategory.Normalize(dto.Category)
+            Category = ExpenseCategory.Normalize(dto.Category),
+            TagEventoId = dto.TagEventoId
         };
 
         await _debtRepository.AddAsync(debt);
@@ -71,6 +72,7 @@ public class DebtService : IDebtService
                 DueDate = dueDate,
                 Notes = dto.Notes,
                 Category = category,
+                TagEventoId = dto.TagEventoId,
                 IsInstallment = true,
                 TotalInstallments = dto.Installments,
                 InstallmentNumber = i + 1,
@@ -113,6 +115,7 @@ public class DebtService : IDebtService
                 DueDate = dueDate,
                 Notes = dto.Notes,
                 Category = category,
+                TagEventoId = dto.TagEventoId,
                 IsInstallment = false,
                 TotalInstallments = dto.Months,
                 InstallmentNumber = i + 1,
@@ -152,6 +155,9 @@ public class DebtService : IDebtService
         if (dto.Category is not null)
             debt.Category = ExpenseCategory.Normalize(dto.Category);
 
+        if (dto.TagEventoId.HasValue)
+            debt.TagEventoId = dto.TagEventoId;
+
         debt.UpdatedAt = DateTime.UtcNow;
         await _debtRepository.UpdateAsync(debt);
         return MapToDto(debt);
@@ -185,6 +191,6 @@ public class DebtService : IDebtService
     private static DebtDto MapToDto(Debt debt) =>
         new(debt.Id, debt.Description, debt.Amount, debt.DueDate,
             debt.IsPaid, debt.PaidAt, debt.Notes, debt.Category,
-            debt.IsInstallment, debt.TotalInstallments, debt.InstallmentNumber, debt.InstallmentGroupId,
+            debt.IsInstallment, debt.TotalInstallments, debt.InstallmentNumber, debt.InstallmentGroupId, debt.TagEventoId,
             debt.CreatedAt);
 }

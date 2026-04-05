@@ -8,8 +8,17 @@ builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 
 // Add CORS
-var allowedOrigins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:5173,http://localhost:3000")
+var configuredOrigins = (builder.Configuration["AllowedOrigins"] ?? string.Empty)
     .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+var allowedOrigins = configuredOrigins
+    .Concat([
+        "http://localhost",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ])
+    .Distinct(StringComparer.OrdinalIgnoreCase)
+    .ToArray();
 
 builder.Services.AddCors(options =>
 {
@@ -31,6 +40,9 @@ var app = builder.Build();
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
+}
+else
+{
     app.UseHttpsRedirection();
 }
 

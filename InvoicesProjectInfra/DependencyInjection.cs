@@ -35,6 +35,7 @@ public static class DependencyInjection
         services.AddScoped<IEmailNotificationRepository, EmailNotificationRepository>();
         services.AddScoped<IEmailSettingsRepository, EmailSettingsRepository>();
         services.AddScoped<ISavingsGoalRepository, SavingsGoalRepository>();
+        services.AddScoped<ITagEventoRepository, TagEventoRepository>();
 
         // Services
         services.AddScoped<IPasswordHasher, PasswordHasher>();
@@ -56,6 +57,8 @@ public static class DependencyInjection
         services.AddScoped<ISavingsGoalService, SavingsGoalService>();
         services.AddScoped<IDocumentImportService, DocumentImportService>();
         services.AddScoped<IBankImportService, BankImportService>();
+        services.AddScoped<IPurchaseSimulationService, PurchaseSimulationService>();
+        services.AddScoped<ITagEventoService, TagEventoService>();
         services.AddScoped<ITelegramService, TelegramService>();
         services.AddScoped<IWhatsAppProvider, BaileysWhatsAppProvider>();
         services.AddScoped<IWhatsAppService, WhatsAppService>();

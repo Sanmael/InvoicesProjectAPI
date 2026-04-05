@@ -13,6 +13,7 @@ public record DebtDto(
     int? TotalInstallments,
     int? InstallmentNumber,
     Guid? InstallmentGroupId,
+    Guid? TagEventoId,
     DateTime CreatedAt
 );
 
@@ -21,7 +22,8 @@ public record CreateDebtDto(
     decimal Amount,
     DateOnly DueDate,
     string? Notes,
-    string? Category = null
+    string? Category = null,
+    Guid? TagEventoId = null
 );
 
 /// <summary>
@@ -34,7 +36,8 @@ public record CreateInstallmentDebtDto(
     DateOnly FirstDueDate,  // Vencimento da 1ª parcela
     int Installments,       // Número de parcelas (máx 60)
     string? Notes,
-    string? Category = null
+    string? Category = null,
+    Guid? TagEventoId = null
 );
 
 /// <summary>
@@ -47,7 +50,8 @@ public record CreateRecurringDebtDto(
     int Months,
     DateOnly? StartDate,
     string? Notes,
-    string? Category = null
+    string? Category = null,
+    Guid? TagEventoId = null
 );
 
 public record UpdateDebtDto(
@@ -56,5 +60,6 @@ public record UpdateDebtDto(
     DateOnly? DueDate,
     bool? IsPaid,
     string? Notes,
-    string? Category = null
+    string? Category = null,
+    Guid? TagEventoId = null
 );

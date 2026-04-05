@@ -19,7 +19,9 @@ public class Receivable : BaseEntity
 
     // Foreign keys
     public Guid UserId { get; set; }
+    public Guid? TagEventoId { get; set; }
 
     // Navigation properties
     public virtual User User { get; set; } = null!;
+    public virtual TagEvento? TagEvento { get; set; }
 }

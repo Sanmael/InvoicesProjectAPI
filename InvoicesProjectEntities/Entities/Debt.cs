@@ -21,7 +21,9 @@ public class Debt : BaseEntity
 
     // Foreign keys
     public Guid UserId { get; set; }
+    public Guid? TagEventoId { get; set; } // Agrupamento temporal (opcional)
 
     // Navigation properties
     public virtual User User { get; set; } = null!;
+    public virtual TagEvento? TagEvento { get; set; }
 }

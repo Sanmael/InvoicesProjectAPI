@@ -11,6 +11,7 @@ public record ReceivableDto(
     bool IsRecurring,
     int? RecurringDay,
     Guid? RecurrenceGroupId,
+    Guid? TagEventoId,
     DateTime CreatedAt
 );
 
@@ -18,7 +19,8 @@ public record CreateReceivableDto(
     string Description,
     decimal Amount,
     DateOnly ExpectedDate,
-    string? Notes
+    string? Notes,
+    Guid? TagEventoId = null
 );
 
 /// <summary>
@@ -29,7 +31,8 @@ public record CreateRecurringReceivableDto(
     decimal Amount,
     int RecurringDay,   // Dia do mês (1-28)
     string? Notes,
-    int Months = 12     // Quantos meses gerar, padrão 12
+    int Months = 12,     // Quantos meses gerar, padrão 12
+    Guid? TagEventoId = null
 );
 
 public record UpdateReceivableDto(
@@ -37,5 +40,6 @@ public record UpdateReceivableDto(
     decimal? Amount,
     DateOnly? ExpectedDate,
     bool? IsReceived,
-    string? Notes
+    string? Notes,
+    Guid? TagEventoId = null
 );

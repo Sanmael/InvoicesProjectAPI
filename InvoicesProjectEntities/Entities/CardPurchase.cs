@@ -16,7 +16,9 @@ public class CardPurchase : BaseEntity
 
     // Foreign keys
     public Guid CreditCardId { get; set; }
+    public Guid? TagEventoId { get; set; } // Agrupamento temporal (opcional)
 
     // Navigation properties
     public virtual CreditCard CreditCard { get; set; } = null!;
+    public virtual TagEvento? TagEvento { get; set; }
 }
