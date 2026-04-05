@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Globalization;
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using InvoicesProjectApplication.DTOs;
@@ -464,6 +466,375 @@ public class ChatService : IChatService
     private static DateOnly ParseDate(string dateStr) =>
         DateOnly.ParseExact(dateStr, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
 
+    private static string FormatCurrency(decimal value) =>
+        $"R${value.ToString("F2", CultureInfo.InvariantCulture)}";
+
+    private static readonly string[] MonthNames =
+    ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
+
+    private static readonly Dictionary<string, int> MonthLookup = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["jan"] = 1, ["janeiro"] = 1,
+        ["fev"] = 2, ["fevereiro"] = 2,
+        ["mar"] = 3, ["marco"] = 3, ["março"] = 3,
+        ["abr"] = 4, ["abril"] = 4,
+        ["mai"] = 5, ["maio"] = 5,
+        ["jun"] = 6, ["junho"] = 6,
+        ["jul"] = 7, ["julho"] = 7,
+        ["ago"] = 8, ["agosto"] = 8,
+        ["set"] = 9, ["setembro"] = 9,
+        ["out"] = 10, ["outubro"] = 10,
+        ["nov"] = 11, ["novembro"] = 11,
+        ["dez"] = 12, ["dezembro"] = 12,
+    };
+
+    private static string? NormalizeMonthKey(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var input = raw.Trim().ToLowerInvariant();
+
+        if (Regex.IsMatch(input, "^\\d{4}-\\d{2}$"))
+            return input;
+
+        var m1 = Regex.Match(input, "^(\\d{2})/(\\d{4})$");
+        if (m1.Success)
+            return $"{m1.Groups[2].Value}-{m1.Groups[1].Value}";
+
+        var m2 = Regex.Match(input, "^([a-zç]{3,9})/(\\d{4})$");
+        if (m2.Success && MonthLookup.TryGetValue(m2.Groups[1].Value, out var monthNum))
+            return $"{m2.Groups[2].Value}-{monthNum:D2}";
+
+        if (MonthLookup.TryGetValue(input, out var monthOnly))
+            return $"{DateTime.UtcNow.Year}-{monthOnly:D2}";
+
+        return null;
+    }
+
+    private static string NormalizeMonthReference(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "invoice";
+        var input = raw.Trim().ToLowerInvariant();
+
+        if (input is "fatura" or "invoice" or "cobranca" or "cobrança")
+            return "invoice";
+        if (input is "compra" or "purchase")
+            return "purchase";
+        if (input is "ambos" or "both")
+            return "both";
+
+        return "invoice";
+    }
+
+    // Mirrors exactly CardPurchaseRepository.IsBilledInMonth: single-installment purchases ALWAYS bill in purchase month
+    private static string GetBillingMonthKey(DateOnly purchaseDate, int closingDay, int totalInstallments, int installmentNumber)
+    {
+        var firstBillingMonth = totalInstallments <= 1 || purchaseDate.Day <= closingDay
+            ? new DateTime(purchaseDate.Year, purchaseDate.Month, 1)
+            : new DateTime(purchaseDate.Year, purchaseDate.Month, 1).AddMonths(1);
+        return firstBillingMonth.AddMonths(installmentNumber - 1).ToString("yyyy-MM");
+    }
+
+    private static bool PurchaseMatchesMonth(DateOnly purchaseDate, int closingDay, int currentInstallment, int totalInstallments, string monthKey)
+    {
+        var purchaseMonthKey = purchaseDate.ToString("yyyy-MM");
+        if (purchaseMonthKey == monthKey) return true;
+
+        for (var inst = Math.Max(1, currentInstallment); inst <= totalInstallments; inst++)
+        {
+            var billedKey = GetBillingMonthKey(purchaseDate, closingDay, totalInstallments, inst);
+            if (billedKey == monthKey) return true;
+        }
+
+        return false;
+    }
+
+    private static bool PurchaseMatchesBillingMonth(DateOnly purchaseDate, int closingDay, int currentInstallment, int totalInstallments, string monthKey)
+    {
+        for (var inst = Math.Max(1, currentInstallment); inst <= totalInstallments; inst++)
+        {
+            var billedKey = GetBillingMonthKey(purchaseDate, closingDay, totalInstallments, inst);
+            if (billedKey == monthKey) return true;
+        }
+
+        return false;
+    }
+
+    private static DateOnly BuildInvoiceDueDate(int year, int month, int dueDay)
+    {
+        var lastDay = DateTime.DaysInMonth(year, month);
+        return new DateOnly(year, month, Math.Min(Math.Max(1, dueDay), lastDay));
+    }
+
+    private async Task<string> BuildAllCardPurchasesReport(Guid userId, string? monthFilter, string? monthReference = null)
+    {
+        var cards = await _creditCardService.GetByUserIdAsync(userId);
+        if (!cards.Any()) return "Nenhum cartão cadastrado.";
+
+        var targetMonth = NormalizeMonthKey(monthFilter);
+        var reference = NormalizeMonthReference(monthReference);
+        var sb = new System.Text.StringBuilder();
+        var monthlyTotals = new SortedDictionary<string, decimal>();
+        decimal grandTotalRemaining = 0;
+
+        foreach (var card in cards)
+        {
+            var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id);
+            var pendingList = purchases.ToList();
+            if (pendingList.Count == 0) continue;
+
+            var cardLines = new List<string>();
+            foreach (var p in pendingList.Take(40))
+            {
+                var remaining = p.Installments - p.CurrentInstallment + 1;
+                var purchaseMonthKey = p.PurchaseDate.ToString("yyyy-MM");
+
+                var installmentValue = p.Amount / p.Installments;
+                var firstBillingMonth = p.Installments <= 1 || p.PurchaseDate.Day <= card.ClosingDay
+                    ? new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1)
+                    : new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1).AddMonths(1);
+
+                for (int inst = p.CurrentInstallment; inst <= p.Installments; inst++)
+                {
+                    var billingMonth = firstBillingMonth.AddMonths(inst - 1);
+                    var key = billingMonth.ToString("yyyy-MM");
+
+                    monthlyTotals.TryAdd(key, 0);
+                    monthlyTotals[key] += installmentValue;
+
+                    var includeByBilling = targetMonth is null || key == targetMonth;
+                    var include = targetMonth is null || (reference switch
+                    {
+                        "purchase" => purchaseMonthKey == targetMonth,
+                        "both" => includeByBilling || purchaseMonthKey == targetMonth,
+                        _ => includeByBilling,
+                    });
+
+                    if (include)
+                    {
+                        cardLines.Add($"  • {p.Description}: {FormatCurrency(installmentValue)}/parcela ({inst}/{p.Installments}x) • compra {p.PurchaseDate:dd/MM/yyyy} • fatura {MonthNames[billingMonth.Month]}/{billingMonth.Year}");
+                    }
+                }
+
+                if (targetMonth is not null
+                    && reference != "invoice"
+                    && purchaseMonthKey == targetMonth
+                    && !cardLines.Any(line => line.Contains($"{p.Description}:", StringComparison.Ordinal)))
+                {
+                    var firstBilling = firstBillingMonth;
+                    cardLines.Add($"  • {p.Description}: {FormatCurrency(installmentValue)}/parcela ({p.CurrentInstallment}/{p.Installments}x) • compra {p.PurchaseDate:dd/MM/yyyy} • próxima fatura {MonthNames[firstBilling.Month]}/{firstBilling.Year}");
+                }
+
+                grandTotalRemaining += installmentValue * remaining;
+            }
+
+            if (cardLines.Count > 0)
+            {
+                sb.AppendLine($"📌 {card.Name} (final {card.LastFourDigits}, fecha dia {card.ClosingDay}, vence dia {card.DueDay}):");
+                foreach (var line in cardLines) sb.AppendLine(line);
+            }
+        }
+
+        if (sb.Length == 0)
+        {
+            if (targetMonth is not null)
+            {
+                var parts = targetMonth.Split('-');
+                var monthNum = int.Parse(parts[1]);
+                var scope = reference == "purchase"
+                    ? "com compra realizada"
+                    : reference == "both" ? "por compra ou fatura" : "em fatura";
+                return $"Nenhuma compra pendente de cartão {scope} para {MonthNames[monthNum]}/{parts[0]}.";
+            }
+            return "Nenhuma compra pendente em nenhum cartão.";
+        }
+
+        if (monthlyTotals.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("📊 Projeção mensal de faturas de cartão (valor que cai na fatura de cada mês):");
+            foreach (var (month, total) in monthlyTotals)
+            {
+                if (targetMonth is not null && month != targetMonth) continue;
+                var parts = month.Split('-');
+                var monthNum = int.Parse(parts[1]);
+                sb.AppendLine($"  {MonthNames[monthNum]}/{parts[0]}: {FormatCurrency(total)}");
+            }
+            if (targetMonth is null)
+                sb.AppendLine($"  Total restante (todas parcelas futuras): {FormatCurrency(grandTotalRemaining)}");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private async Task<string> BuildUpcomingDueItemsReport(Guid userId, int days)
+    {
+        var horizon = Math.Clamp(days, 1, 31);
+        var today = DateOnly.FromDateTime(DateTime.UtcNow.Date);
+        var end = today.AddDays(horizon);
+
+        var debts = (await _debtService.GetPendingByUserIdAsync(userId))
+            .Where(d => d.DueDate >= today && d.DueDate <= end)
+            .OrderBy(d => d.DueDate)
+            .ToList();
+
+        var receivables = (await _receivableService.GetPendingByUserIdAsync(userId))
+            .Where(r => r.ExpectedDate >= today && r.ExpectedDate <= end)
+            .OrderBy(r => r.ExpectedDate)
+            .ToList();
+
+        var cardInstallments = new List<(DateOnly DueDate, string CardName, string LastFour, string Description, decimal InstallmentValue, int Installment, int TotalInstallments)>();
+        var cards = await _creditCardService.GetByUserIdAsync(userId);
+        foreach (var card in cards)
+        {
+            var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id);
+            foreach (var p in purchases)
+            {
+                for (var inst = p.CurrentInstallment; inst <= p.Installments; inst++)
+                {
+                    var billingKey = GetBillingMonthKey(p.PurchaseDate, card.ClosingDay, p.Installments, inst);
+                    var split = billingKey.Split('-');
+                    var dueDate = BuildInvoiceDueDate(int.Parse(split[0]), int.Parse(split[1]), card.DueDay);
+                    if (dueDate < today || dueDate > end) continue;
+
+                    cardInstallments.Add((
+                        dueDate,
+                        card.Name,
+                        card.LastFourDigits,
+                        p.Description,
+                        p.Amount / p.Installments,
+                        inst,
+                        p.Installments));
+                }
+            }
+        }
+
+        cardInstallments = cardInstallments.OrderBy(c => c.DueDate).ThenBy(c => c.CardName).ToList();
+
+        var outgoing = debts.Sum(d => d.Amount) + cardInstallments.Sum(c => c.InstallmentValue);
+        var incoming = receivables.Sum(r => r.Amount);
+        var net = incoming - outgoing;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Janela: hoje ({today:dd/MM/yyyy}) até {end:dd/MM/yyyy} ({horizon} dias)");
+        sb.AppendLine($"Saídas previstas: {FormatCurrency(outgoing)} | Entradas previstas: {FormatCurrency(incoming)} | Saldo líquido: {FormatCurrency(net)}");
+        sb.AppendLine();
+
+        sb.AppendLine("📉 Débitos a vencer:");
+        if (debts.Count == 0) sb.AppendLine("• Nenhum débito no período.");
+        foreach (var d in debts.Take(20))
+            sb.AppendLine($"• {d.Description} — {FormatCurrency(d.Amount)} (venc. {d.DueDate:dd/MM/yyyy})");
+
+        sb.AppendLine();
+        sb.AppendLine("💳 Faturas/parcelas de cartão no período:");
+        if (cardInstallments.Count == 0) sb.AppendLine("• Nenhuma parcela com vencimento no período.");
+        foreach (var c in cardInstallments.Take(25))
+            sb.AppendLine($"• {c.CardName} final {c.LastFour} — {c.Description}: {FormatCurrency(c.InstallmentValue)} ({c.Installment}/{c.TotalInstallments}x) • vence {c.DueDate:dd/MM/yyyy}");
+
+        sb.AppendLine();
+        sb.AppendLine("📈 Recebíveis previstos:");
+        if (receivables.Count == 0) sb.AppendLine("• Nenhum recebível no período.");
+        foreach (var r in receivables.Take(20))
+            sb.AppendLine($"• {r.Description} — {FormatCurrency(r.Amount)} (prev. {r.ExpectedDate:dd/MM/yyyy})");
+
+        return sb.ToString().TrimEnd();
+    }
+
+    private async Task<string> BuildMonthlyDiagnostic(Guid userId, string? monthArg)
+    {
+        var targetMonth = NormalizeMonthKey(monthArg) ?? DateTime.UtcNow.ToString("yyyy-MM");
+        var split = targetMonth.Split('-');
+        var year = int.Parse(split[0]);
+        var month = int.Parse(split[1]);
+
+        // Use ALL items for the month (paid + pending) so the diagnostic is a true committed picture
+        var allDebts = (await _debtService.GetByUserIdAsync(userId))
+            .Where(d => d.DueDate.Year == year && d.DueDate.Month == month)
+            .OrderBy(d => d.DueDate)
+            .ToList();
+
+        var allReceivables = (await _receivableService.GetByUserIdAsync(userId))
+            .Where(r => r.ExpectedDate.Year == year && r.ExpectedDate.Month == month)
+            .OrderBy(r => r.ExpectedDate)
+            .ToList();
+
+        var pendingDebts = allDebts.Where(d => !d.IsPaid).ToList();
+        var pendingReceivables = allReceivables.Where(r => !r.IsReceived).ToList();
+
+        // Cards: loop from inst=1 (not CurrentInstallment) to include already-paid installments
+        decimal cardsTotal = 0;
+        decimal cardsPending = 0;
+        var cardHighlights = new List<string>();
+        var cards = await _creditCardService.GetByUserIdAsync(userId);
+        foreach (var card in cards)
+        {
+            var cardCommitted = 0m;
+            var cardPendingAmt = 0m;
+            var allPurchases = (await _cardPurchaseService.GetByCreditCardIdAsync(card.Id)).ToList();
+            foreach (var p in allPurchases)
+            {
+                var installmentValue = p.Amount / p.Installments;
+                for (var inst = 1; inst <= p.Installments; inst++)
+                {
+                    var billingKey = GetBillingMonthKey(p.PurchaseDate, card.ClosingDay, p.Installments, inst);
+                    if (billingKey != targetMonth) continue;
+                    cardCommitted += installmentValue;
+                    // Pending: only installments that haven't been paid yet
+                    if (!p.IsPaid && inst >= p.CurrentInstallment)
+                        cardPendingAmt += installmentValue;
+                }
+            }
+
+            if (cardCommitted > 0)
+                cardHighlights.Add($"• {card.Name} (final {card.LastFourDigits}): {FormatCurrency(cardCommitted)} total • {FormatCurrency(cardPendingAmt)} pendente");
+
+            cardsTotal += cardCommitted;
+            cardsPending += cardPendingAmt;
+        }
+
+        var debtsTotal = allDebts.Sum(d => d.Amount);
+        var receivablesTotal = allReceivables.Sum(r => r.Amount);
+        var debtsPending = pendingDebts.Sum(d => d.Amount);
+        var receivablesPending = pendingReceivables.Sum(r => r.Amount);
+
+        var committedOutgoing = debtsTotal + cardsTotal;
+        var committedBalance = receivablesTotal - committedOutgoing;
+        var pendingOutgoing = debtsPending + cardsPending;
+        var pendingBalance = receivablesPending - pendingOutgoing;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"Diagnóstico {MonthNames[month]}/{year} (visão commitada — inclui itens já pagos)");
+        sb.AppendLine();
+        sb.AppendLine($"📊 Comprometido no mês:");
+        sb.AppendLine($"• Recebíveis: {FormatCurrency(receivablesTotal)}");
+        sb.AppendLine($"• Débitos: {FormatCurrency(debtsTotal)}");
+        sb.AppendLine($"• Cartões (fatura do mês): {FormatCurrency(cardsTotal)}");
+        sb.AppendLine($"• Saídas totais: {FormatCurrency(committedOutgoing)} | Saldo: {FormatCurrency(committedBalance)}");
+        sb.AppendLine();
+        sb.AppendLine($"⏳ Ainda pendente:");
+        sb.AppendLine($"• A receber: {FormatCurrency(receivablesPending)} | A pagar: {FormatCurrency(pendingOutgoing)} | Saldo livre: {FormatCurrency(pendingBalance)}");
+        sb.AppendLine();
+
+        if (cardHighlights.Count > 0)
+        {
+            sb.AppendLine("💳 Cartões (comprometido | pendente):");
+            foreach (var line in cardHighlights) sb.AppendLine(line);
+            sb.AppendLine();
+        }
+
+        sb.AppendLine("📉 Débitos do mês:");
+        if (allDebts.Count == 0) sb.AppendLine("• Nenhum débito neste mês.");
+        foreach (var d in allDebts.Take(10))
+            sb.AppendLine($"• {(d.IsPaid ? "✅" : "⏳")} {d.Description} — {FormatCurrency(d.Amount)} (venc. {d.DueDate:dd/MM/yyyy})");
+
+        sb.AppendLine();
+        sb.AppendLine("📈 Recebíveis do mês:");
+        if (allReceivables.Count == 0) sb.AppendLine("• Nenhum recebível neste mês.");
+        foreach (var r in allReceivables.Take(10))
+            sb.AppendLine($"• {(r.IsReceived ? "✅" : "⏳")} {r.Description} — {FormatCurrency(r.Amount)} (prev. {r.ExpectedDate:dd/MM/yyyy})");
+
+        return sb.ToString().TrimEnd();
+    }
+
     private async Task<Guid> ResolveCreditCardIdAsync(Guid userId, string identifier)
     {
         if (Guid.TryParse(identifier, out var cardId))
@@ -499,7 +870,7 @@ public class ChatService : IChatService
                 var debt = await _debtService.CreateAsync(userId, dto);
                 actions.Add(new ChatActionResult("create_debt",
                     $"Débito '{debt.Description}' R${debt.Amount:F2} venc. {debt.DueDate:dd/MM/yyyy} [{debt.Category}]", true));
-                return $"Débito criado. ID: {debt.Id}, {debt.Description}, R${debt.Amount:F2}, venc. {debt.DueDate:dd/MM/yyyy}, categoria: {debt.Category}";
+                return $"Débito criado: {debt.Description} • {FormatCurrency(debt.Amount)} • venc. {debt.DueDate:dd/MM/yyyy} • categoria {debt.Category}.";
             }
 
             case "create_recurring_debt":
@@ -534,26 +905,35 @@ public class ChatService : IChatService
 
             case "list_pending_debts":
             {
+                var args = JsonSerializer.Deserialize<ListPendingDebtsArgs>(argsJson, JsonOptions);
+                var monthFilter = NormalizeMonthKey(args?.Month);
                 var debts = await _debtService.GetPendingByUserIdAsync(userId);
                 var debtList = debts.ToList();
+                if (!string.IsNullOrWhiteSpace(monthFilter))
+                    debtList = debtList.Where(d => d.DueDate.ToString("yyyy-MM") == monthFilter).ToList();
                 if (debtList.Count == 0)
                 {
                     actions.Add(new ChatActionResult("list_pending_debts", "Listou débitos pendentes", true));
+                    if (!string.IsNullOrWhiteSpace(monthFilter))
+                    {
+                        var parts = monthFilter.Split('-');
+                        return $"Nenhum débito pendente para {MonthNames[int.Parse(parts[1])]}/{parts[0]}.";
+                    }
                     return "Nenhum débito pendente.";
                 }
                 var grouped = debtList.GroupBy(d => d.DueDate.ToString("yyyy-MM")).OrderBy(g => g.Key);
-                string[] mn = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
-                var sb = new System.Text.StringBuilder("Débitos pendentes por mês:\n");
+                var sb = new System.Text.StringBuilder("Débitos pendentes por mês:\n\n");
                 foreach (var g in grouped)
                 {
                     var parts = g.Key.Split('-');
                     var monthTotal = g.Sum(d => d.Amount);
-                    sb.AppendLine($"📅 {mn[int.Parse(parts[1])]}/{parts[0]} (total: R${monthTotal:F2}):");
+                    sb.AppendLine($"📅 {MonthNames[int.Parse(parts[1])]}/{parts[0]} (total: {FormatCurrency(monthTotal)})");
                     foreach (var d in g.Take(15))
-                        sb.AppendLine($"  - [ID: {d.Id}] {d.Description}: R${d.Amount:F2} (venc. {d.DueDate:dd/MM/yyyy})");
+                        sb.AppendLine($"• {d.Description} — {FormatCurrency(d.Amount)} (venc. {d.DueDate:dd/MM/yyyy})");
+                    sb.AppendLine();
                 }
                 actions.Add(new ChatActionResult("list_pending_debts", "Listou débitos pendentes", true));
-                return sb.ToString();
+                return sb.ToString().TrimEnd();
             }
 
             // ─── RECEBÍVEIS ───
@@ -564,7 +944,7 @@ public class ChatService : IChatService
                 var receivable = await _receivableService.CreateAsync(userId, dto);
                 actions.Add(new ChatActionResult("create_receivable",
                     $"Recebível '{receivable.Description}' R${receivable.Amount:F2} previsão {receivable.ExpectedDate:dd/MM/yyyy}", true));
-                return $"Recebível criado. ID: {receivable.Id}, {receivable.Description}, R${receivable.Amount:F2}, data {receivable.ExpectedDate:dd/MM/yyyy}";
+                return $"Recebível criado: {receivable.Description} • {FormatCurrency(receivable.Amount)} • previsão {receivable.ExpectedDate:dd/MM/yyyy}.";
             }
 
             case "create_recurring_receivable":
@@ -595,26 +975,35 @@ public class ChatService : IChatService
 
             case "list_pending_receivables":
             {
+                var args = JsonSerializer.Deserialize<ListPendingReceivablesArgs>(argsJson, JsonOptions);
+                var monthFilter = NormalizeMonthKey(args?.Month);
                 var receivables = await _receivableService.GetPendingByUserIdAsync(userId);
                 var recList = receivables.ToList();
+                if (!string.IsNullOrWhiteSpace(monthFilter))
+                    recList = recList.Where(r => r.ExpectedDate.ToString("yyyy-MM") == monthFilter).ToList();
                 if (recList.Count == 0)
                 {
                     actions.Add(new ChatActionResult("list_pending_receivables", "Listou recebíveis pendentes", true));
+                    if (!string.IsNullOrWhiteSpace(monthFilter))
+                    {
+                        var parts = monthFilter.Split('-');
+                        return $"Nenhum recebível pendente para {MonthNames[int.Parse(parts[1])]}/{parts[0]}.";
+                    }
                     return "Nenhum recebível pendente.";
                 }
                 var grouped = recList.GroupBy(r => r.ExpectedDate.ToString("yyyy-MM")).OrderBy(g => g.Key);
-                string[] mn = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
-                var sb = new System.Text.StringBuilder("Recebíveis pendentes por mês:\n");
+                var sb = new System.Text.StringBuilder("Recebíveis pendentes por mês:\n\n");
                 foreach (var g in grouped)
                 {
                     var parts = g.Key.Split('-');
                     var monthTotal = g.Sum(r => r.Amount);
-                    sb.AppendLine($"📅 {mn[int.Parse(parts[1])]}/{parts[0]} (total: R${monthTotal:F2}):");
+                    sb.AppendLine($"📅 {MonthNames[int.Parse(parts[1])]}/{parts[0]} (total: {FormatCurrency(monthTotal)})");
                     foreach (var r in g.Take(15))
-                        sb.AppendLine($"  - [ID: {r.Id}] {r.Description}: R${r.Amount:F2} (previsão {r.ExpectedDate:dd/MM/yyyy}){(r.IsRecurring ? " 🔄 recorrente" : "")}");
+                        sb.AppendLine($"• {r.Description} — {FormatCurrency(r.Amount)} (previsão {r.ExpectedDate:dd/MM/yyyy}){(r.IsRecurring ? " • recorrente" : "")}");
+                    sb.AppendLine();
                 }
                 actions.Add(new ChatActionResult("list_pending_receivables", "Listou recebíveis pendentes", true));
-                return sb.ToString();
+                return sb.ToString().TrimEnd();
             }
 
             // ─── CARTÕES DE CRÉDITO ───
@@ -625,7 +1014,7 @@ public class ChatService : IChatService
                 var card = await _creditCardService.CreateAsync(userId, dto);
                 actions.Add(new ChatActionResult("create_credit_card",
                     $"Cartão '{card.Name}' final {card.LastFourDigits} criado", true));
-                return $"Cartão criado. ID: {card.Id}, {card.Name}, final {card.LastFourDigits}, limite R${card.CreditLimit:F2}, fecha dia {card.ClosingDay}, vence dia {card.DueDay}";
+                return $"Cartão criado: {card.Name} • final {card.LastFourDigits} • limite {FormatCurrency(card.CreditLimit ?? 0)} • fecha dia {card.ClosingDay} • vence dia {card.DueDay}.";
             }
 
             case "edit_credit_card":
@@ -643,7 +1032,7 @@ public class ChatService : IChatService
             {
                 var cards = await _creditCardService.GetByUserIdAsync(userId);
                 var list = cards.Select(c =>
-                    $"- [ID: {c.Id}] {c.Name} final {c.LastFourDigits} | Limite: R${c.CreditLimit:F2} | Fecha dia {c.ClosingDay} | Vence dia {c.DueDay} | Pendente: R${c.TotalPending:F2}");
+                    $"• {c.Name} (final {c.LastFourDigits}) — Limite: {FormatCurrency(c.CreditLimit ?? 0)} • Fecha dia {c.ClosingDay} • Vence dia {c.DueDay} • Pendente: {FormatCurrency(c.TotalPending)}");
                 var result = list.Any()
                     ? $"Seus cartões:\n{string.Join("\n", list)}"
                     : "Nenhum cartão cadastrado.";
@@ -662,7 +1051,7 @@ public class ChatService : IChatService
                 var purchase = await _cardPurchaseService.CreateAsync(dto);
                 actions.Add(new ChatActionResult("create_card_purchase",
                     $"Compra '{purchase.Description}' R${purchase.Amount:F2} em {purchase.Installments}x registrada", true));
-                return $"Compra registrada. ID: {purchase.Id}, {purchase.Description}, R${purchase.Amount:F2}, {purchase.Installments}x";
+                return $"Compra registrada: {purchase.Description} • {FormatCurrency(purchase.Amount)} • {purchase.Installments}x.";
             }
 
             case "edit_card_purchase":
@@ -685,10 +1074,43 @@ public class ChatService : IChatService
             case "list_card_purchases":
             {
                 var args = JsonSerializer.Deserialize<ListCardPurchasesArgs>(argsJson, JsonOptions)!;
+                var reference = NormalizeMonthReference(args.MonthReference);
+                if (args.CreditCardId.Equals("todos", StringComparison.OrdinalIgnoreCase)
+                    || args.CreditCardId.Equals("all", StringComparison.OrdinalIgnoreCase)
+                    || args.CreditCardId.Contains("todos", StringComparison.OrdinalIgnoreCase))
+                {
+                    actions.Add(new ChatActionResult("list_card_purchases", "Listou compras de todos os cartões", true));
+                    var allReport = await BuildAllCardPurchasesReport(userId, args.Month, reference);
+                    return $"Compras pendentes em todos os cartões:\n{allReport}";
+                }
+
                 var cardId = await ResolveCreditCardIdAsync(userId, args.CreditCardId);
                 var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(cardId);
-                var list = purchases.Take(15).Select(p =>
-                    $"- [ID: {p.Id}] {p.Description}: R${p.Amount:F2} ({p.CurrentInstallment}/{p.Installments}x) {p.PurchaseDate:dd/MM/yyyy}");
+                var monthFilter = NormalizeMonthKey(args.Month);
+                var card = await _creditCardService.GetByIdAsync(cardId);
+                if (card is null)
+                    return "Cartão não encontrado.";
+                var filteredPurchases = string.IsNullOrWhiteSpace(monthFilter)
+                    ? purchases
+                    : purchases.Where(p => reference switch
+                    {
+                        "purchase" => p.PurchaseDate.ToString("yyyy-MM") == monthFilter,
+                        "both" => PurchaseMatchesMonth(
+                            p.PurchaseDate,
+                            card.ClosingDay,
+                            p.CurrentInstallment,
+                            p.Installments,
+                            monthFilter),
+                        _ => PurchaseMatchesBillingMonth(
+                            p.PurchaseDate,
+                            card.ClosingDay,
+                            p.CurrentInstallment,
+                            p.Installments,
+                            monthFilter),
+                    });
+
+                var list = filteredPurchases.Take(15).Select(p =>
+                    $"• {p.Description} — {FormatCurrency(p.Amount)} ({p.CurrentInstallment}/{p.Installments}x) • compra em {p.PurchaseDate:dd/MM/yyyy}");
                 var result = list.Any()
                     ? $"Compras pendentes:\n{string.Join("\n", list)}"
                     : "Nenhuma compra pendente neste cartão.";
@@ -698,64 +1120,29 @@ public class ChatService : IChatService
 
             case "list_all_card_purchases":
             {
-                var cards = await _creditCardService.GetByUserIdAsync(userId);
-                if (!cards.Any())
-                {
-                    actions.Add(new ChatActionResult("list_all_card_purchases", "Nenhum cartão cadastrado", true));
-                    return "Nenhum cartão cadastrado.";
-                }
-
-                var sb = new System.Text.StringBuilder();
-                var monthlyTotals = new SortedDictionary<string, decimal>();
-                decimal grandTotalRemaining = 0;
-
-                foreach (var card in cards)
-                {
-                    var purchases = await _cardPurchaseService.GetPendingByCreditCardIdAsync(card.Id);
-                    var pendingList = purchases.ToList();
-                    if (pendingList.Count == 0) continue;
-
-                    sb.AppendLine($"📌 {card.Name} (final {card.LastFourDigits}, fecha dia {card.ClosingDay}, vence dia {card.DueDay}):");
-                    foreach (var p in pendingList.Take(20))
-                    {
-                        var remaining = p.Installments - p.CurrentInstallment + 1;
-                        sb.AppendLine($"  - [ID: {p.Id}] {p.Description}: R${p.Amount:F2}/parcela ({p.CurrentInstallment}/{p.Installments}x, restam {remaining}) compra {p.PurchaseDate:dd/MM/yyyy}");
-
-                        // Calculate billing month for each remaining installment
-                        var firstBillingMonth = p.PurchaseDate.Day <= card.ClosingDay
-                            ? new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1)
-                            : new DateTime(p.PurchaseDate.Year, p.PurchaseDate.Month, 1).AddMonths(1);
-
-                        for (int inst = p.CurrentInstallment; inst <= p.Installments; inst++)
-                        {
-                            var billingMonth = firstBillingMonth.AddMonths(inst - 1);
-                            var key = billingMonth.ToString("yyyy-MM");
-                            monthlyTotals.TryAdd(key, 0);
-                            monthlyTotals[key] += p.Amount;
-                        }
-                        grandTotalRemaining += p.Amount * remaining;
-                    }
-                }
-
-                if (monthlyTotals.Count > 0)
-                {
-                    string[] monthNames = ["", "Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
-                    sb.AppendLine();
-                    sb.AppendLine("📊 Projeção mensal de faturas de cartão (valor que cai na fatura de cada mês):");
-                    foreach (var (month, total) in monthlyTotals)
-                    {
-                        var parts = month.Split('-');
-                        var monthNum = int.Parse(parts[1]);
-                        sb.AppendLine($"  {monthNames[monthNum]}/{parts[0]}: R${total:F2}");
-                    }
-                    sb.AppendLine($"  Total restante (todas parcelas futuras): R${grandTotalRemaining:F2}");
-                }
-
-                var result = sb.Length > 0
-                    ? $"Compras pendentes em todos os cartões:\n{sb}"
-                    : "Nenhuma compra pendente em nenhum cartão.";
+                var args = JsonSerializer.Deserialize<ListAllCardPurchasesArgs>(argsJson, JsonOptions);
+                var reference = NormalizeMonthReference(args?.MonthReference);
+                var report = await BuildAllCardPurchasesReport(userId, args?.Month, reference);
+                var result = $"Compras pendentes em todos os cartões:\n{report}";
                 actions.Add(new ChatActionResult("list_all_card_purchases", "Listou compras de todos os cartões", true));
                 return result;
+            }
+
+            case "get_upcoming_due_items":
+            {
+                var args = JsonSerializer.Deserialize<GetUpcomingDueItemsArgs>(argsJson, JsonOptions);
+                var horizonDays = args?.Days ?? 7;
+                var report = await BuildUpcomingDueItemsReport(userId, horizonDays);
+                actions.Add(new ChatActionResult("get_upcoming_due_items", $"Consultou vencimentos dos próximos {Math.Clamp(horizonDays, 1, 31)} dias", true));
+                return report;
+            }
+
+            case "get_monthly_diagnostic":
+            {
+                var args = JsonSerializer.Deserialize<GetMonthlyDiagnosticArgs>(argsJson, JsonOptions);
+                var report = await BuildMonthlyDiagnostic(userId, args?.Month);
+                actions.Add(new ChatActionResult("get_monthly_diagnostic", "Gerou diagnóstico mensal", true));
+                return report;
             }
 
             default:
@@ -794,6 +1181,12 @@ public class ChatService : IChatService
             - NUNCA responda com base no histórico da conversa ou na sua memória. SEMPRE chame a ferramenta para buscar dados atualizados.
             - Mesmo que você já tenha listado antes na mesma conversa, chame a ferramenta novamente.
             - Ao apresentar o resultado de uma listagem, SEMPRE mostre TODOS os itens retornados pela ferramenta, um por um. NUNCA diga apenas "você tem X itens" sem listar quais são.
+            - Se o usuário pedir um mês específico (ex: "abril", "abr/2026", "2026-04"), inclua esse mês no parâmetro month da ferramenta de listagem.
+            - Se o usuário pedir "todos os cartões", use list_all_card_purchases (NÃO use list_card_purchases com credit_card_id="todos").
+                        - Para consultas de cartão com mês específico, use month_reference conforme intenção:
+                            "fatura/debitos do cartão no mês" => month_reference="invoice";
+                            "compras feitas no mês" => month_reference="purchase";
+                            se estiver ambíguo, use month_reference="both" e explique os dois recortes.
 
             REGRA DE CONSULTA DE SALDO/LIMITE (OBRIGATÓRIA):
             - Quando o usuário perguntar se pode comprar algo, quanto tem de limite, saldo disponível ou qualquer valor calculado, você DEVE chamar list_credit_cards ou list_card_purchases ANTES de responder.
@@ -806,6 +1199,13 @@ public class ChatService : IChatService
                         - Débitos pendentes: filtre pelo vencimento do mês em questão. Compras no cartão: use o valor do mês da projeção. Recebíveis: filtre pela data prevista do mês.
                         - SEMPRE calcule saldo_livre do mês = recebiveis_do_mês - (debitos_do_mês + cartoes_do_mês).
                         - Exemplo: "Abril/2026: Recebíveis R$12.300 | Débitos R$1.691,74 | Cartões R$1.986,72 | Saídas R$3.678,46 | Saldo livre R$8.621,54"
+                        - Para esse cenário, prefira usar a ferramenta get_monthly_diagnostic.
+
+                        REGRA DE VENCIMENTOS PRÓXIMOS (OBRIGATÓRIA):
+                        - Quando o usuário pedir "o que vence nos próximos X dias", "o que tenho essa semana", "quais contas vencem em breve", você DEVE chamar a ferramenta get_upcoming_due_items.
+                        - Se o usuário não informar X, use 7 dias por padrão.
+                        - SEMPRE liste TODOS os itens retornados pela ferramenta com nome completo, valor e data. NUNCA diga apenas "você tem 1 débito de R$X" sem dizer o nome do débito.
+                        - Para get_monthly_diagnostic, apresente os dois blocos: comprometido total e pendente. Destaque o saldo livre do que ainda está pendente.
 
                         REGRA DE PLANEJAMENTO DE COMPRA E META (OBRIGATÓRIA):
                         - Quando o usuário pedir "melhor forma de comprar" algo, comparar à vista vs parcelado, simular compra, ou perguntar se consegue manter meta de economia, você DEVE chamar a ferramenta generate_purchase_plan.
@@ -920,7 +1320,10 @@ public class ChatService : IChatService
 
         Tool("list_pending_debts",
             "Lista débitos pendentes (não pagos) com seus IDs.",
-            new Dictionary<string, object>(), []),
+            new Dictionary<string, object>
+            {
+                ["month"] = new { type = "string", description = "Mês opcional (yyyy-MM, MM/yyyy ou Abr/2026)" },
+            }, []),
 
         // ─── RECEBÍVEIS ───
         Tool("create_receivable",
@@ -960,7 +1363,10 @@ public class ChatService : IChatService
 
         Tool("list_pending_receivables",
             "Lista recebíveis pendentes (não recebidos) com seus IDs.",
-            new Dictionary<string, object>(), []),
+            new Dictionary<string, object>
+            {
+                ["month"] = new { type = "string", description = "Mês opcional (yyyy-MM, MM/yyyy ou Abr/2026)" },
+            }, []),
 
         // ─── CARTÕES DE CRÉDITO ───
         Tool("create_credit_card",
@@ -1026,12 +1432,32 @@ public class ChatService : IChatService
             new Dictionary<string, object>
             {
                 ["credit_card_id"] = new { type = "string", description = "ID ou nome do cartão (ex: GUID ou 'Nubank')" },
+                ["month"] = new { type = "string", description = "Mês opcional (yyyy-MM, MM/yyyy ou Abr/2026)" },
+                ["month_reference"] = new { type = "string", description = "Referência do mês: invoice (mês da fatura), purchase (mês da compra) ou both (ambos). Padrão: invoice" },
             },
             ["credit_card_id"]),
 
         Tool("list_all_card_purchases",
             "Lista TODAS as compras pendentes de TODOS os cartões do usuário. Use quando precisar de uma visão geral das compras no cartão.",
-            new Dictionary<string, object>(), []),
+            new Dictionary<string, object>
+            {
+                ["month"] = new { type = "string", description = "Mês opcional (yyyy-MM, MM/yyyy ou Abr/2026)" },
+                ["month_reference"] = new { type = "string", description = "Referência do mês: invoice (mês da fatura), purchase (mês da compra) ou both (ambos). Padrão: invoice" },
+            }, []),
+
+        Tool("get_upcoming_due_items",
+            "Mostra vencimentos e recebimentos dos próximos dias (débitos, parcelas/faturas de cartão e recebíveis), com saldo líquido do período.",
+            new Dictionary<string, object>
+            {
+                ["days"] = new { type = "integer", description = "Janela em dias (1-31). Padrão: 7" },
+            }, []),
+
+        Tool("get_monthly_diagnostic",
+            "Gera diagnóstico financeiro completo de um mês: recebíveis, débitos, cartão por mês de fatura, saídas totais e saldo livre.",
+            new Dictionary<string, object>
+            {
+                ["month"] = new { type = "string", description = "Mês opcional (yyyy-MM, MM/yyyy ou Abr/2026). Padrão: mês atual" },
+            }, []),
 
         Tool("generate_purchase_plan",
             "Gera um plano de compra estruturado com projeção mensal, cenários (PIX, cartão à vista, parcelado) e recomendação. Use SEMPRE que o usuário quiser comprar algo e pedir para planejar/simular/comparar formas de pagamento. O resultado é exibido visualmente no frontend.",
@@ -1131,7 +1557,25 @@ public class ChatService : IChatService
         int? Installments, string? Notes, string? Category);
 
     private record ListCardPurchasesArgs(
-        [property: JsonPropertyName("credit_card_id")] string CreditCardId);
+        [property: JsonPropertyName("credit_card_id")] string CreditCardId,
+        [property: JsonPropertyName("month")] string? Month,
+        [property: JsonPropertyName("month_reference")] string? MonthReference);
+
+    private record ListAllCardPurchasesArgs(
+        [property: JsonPropertyName("month")] string? Month,
+        [property: JsonPropertyName("month_reference")] string? MonthReference);
+
+    private record ListPendingDebtsArgs(
+        [property: JsonPropertyName("month")] string? Month);
+
+    private record ListPendingReceivablesArgs(
+        [property: JsonPropertyName("month")] string? Month);
+
+    private record GetUpcomingDueItemsArgs(
+        [property: JsonPropertyName("days")] int? Days);
+
+    private record GetMonthlyDiagnosticArgs(
+        [property: JsonPropertyName("month")] string? Month);
 
     private record GeneratePurchasePlanArgs(
         [property: JsonPropertyName("product_name")] string ProductName,
